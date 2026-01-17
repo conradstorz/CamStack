@@ -244,7 +244,10 @@ def run_player_once(url: str) -> int:
     cmd = [
         "mpv", "--hwdec=auto", "--fs", "--force-window=yes", "--osc=no",
         "--no-input-default-bindings", "--sub-file", str(OVL), "--sid=1",
-        "--no-border", "--really-quiet", "--msg-level", "all=fatal", url
+        "--no-border", "--really-quiet", "--msg-level", "all=fatal",
+        "--network-timeout=15", "--rtsp-transport=tcp",
+        "--demuxer-max-bytes=32MiB", "--cache-secs=10",
+        "--demuxer-readahead-secs=5", url
     ]
     logger.info(f"Launching mpv: {url}")
     proc = subprocess.run(cmd)
@@ -261,6 +264,58 @@ def launch_rtsp_then_fallback() -> int:
         rc = run_player_once(url)
         if rc == 0:
             return rc
+    write_overlay(True)
+    fb = get_featured_fallback_url()
+    logger.warning("RTSP missing or failed; switching to fallback nature cam")
+    return run_player_once(fb)
+
+def launch_rtsp_with_watchdog() -> int:
+    """Launch player with systemd watchdog support and health monitoring."""
+    import os, time, signal, threading
+    
+    # Check if running under systemd with watchdog
+    watchdog_usec = os.environ.get("WATCHDOG_USEC")
+    watchdog_enabled = watchdog_usec is not None
+    
+    if watchdog_enabled:
+        watchdog_interval = int(watchdog_usec) / 2_000_000  # Send notification at half interval
+        logger.info(f"Systemd watchdog enabled, interval: {watchdog_interval}s")
+        
+        def notify_watchdog():
+            """Periodically notify systemd that we're alive."""
+            while True:
+                try:
+                    # Send watchdog keep-alive to systemd
+                    subprocess.run(["systemd-notify", "WATCHDOG=1"], 
+                                 check=False, capture_output=True)
+                    time.sleep(watchdog_interval)
+                except Exception as e:
+                    logger.debug(f"Watchdog notification failed: {e}")
+                    time.sleep(10)
+        
+        # Start watchdog thread
+        wd_thread = threading.Thread(target=notify_watchdog, daemon=True)
+        wd_thread.start()
+    
+    # Notify systemd we're ready
+    subprocess.run(["systemd-notify", "--ready"], check=False, capture_output=True)
+    
+    # Launch player with watchdog monitoring
+    url = None
+    if CFG.exists():
+        try:
+            url = json.loads(CFG.read_text()).get("rtsp_url")
+        except Exception:
+            pass
+    
+    if url:
+        logger.info(f"Attempting RTSP stream: {url}")
+        rc = run_player_once(url)
+        if rc == 0:
+            return rc
+        logger.warning(f"RTSP player exited with code {rc}")
+    
+    # Fallback to nature cam
     write_overlay(True)
     fb = get_featured_fallback_url()
     logger.warning("RTSP missing or failed; switching to fallback nature cam")
@@ -987,6 +1042,9 @@ WorkingDirectory=/opt/camstack
 ExecStart=/opt/camstack/scripts/run_camplayer.sh
 Restart=always
 RestartSec=2
+TimeoutStartSec=30
+TimeoutStopSec=10
+WatchdogSec=60
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
@@ -1080,11 +1138,15 @@ cat > "$CAMROOT/scripts/run_camplayer.sh" <<"EOF"
 #!/usr/bin/env bash
 set -euo pipefail
 cd /opt/camstack
+
+# Generate overlay
 /opt/camstack/.venv/bin/python -m app.overlay_gen
+
+# Run player with watchdog support
 /opt/camstack/.venv/bin/python - <<'PY'
-from app.player import launch_rtsp_then_fallback
+from app.player import launch_rtsp_with_watchdog
 import sys
-sys.exit(launch_rtsp_then_fallback())
+sys.exit(launch_rtsp_with_watchdog())
 PY
 EOF
 chmod +x "$CAMROOT/scripts/run_camplayer.sh"
@@ -1098,7 +1160,7 @@ CN_DEFAULT="${CAMSTACK_CN:-camstack.lan}"    # Common Name for cert
 
 echo "[*] Preparing system packages..."
 apt update
-apt install -y mpv ffmpeg yt-dlp python3 python3-venv jq git tree curl openssl
+apt install -y mpv ffmpeg yt-dlp python3 python3-venv jq git tree curl openssl systemd
 
 mkdir -p /opt/camstack/runtime/snaps /opt/camstack/logs /opt/camstack/certs /opt/camstack/ca
 cd /opt/camstack
