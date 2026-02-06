@@ -1,0 +1,13 @@
+[Unit]
+Description=HTTP->HTTPS redirector (port 80) v1.0.0
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/camstack
+ExecStart=/opt/camstack/.venv/bin/uvicorn app.redirect_http:app --host 0.0.0.0 --port 80
+Restart=always
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

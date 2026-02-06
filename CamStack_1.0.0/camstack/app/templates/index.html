@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+{% block content %}
+
+<p class="muted">Device IP: <b>{{ ip }}</b> — Admin UI at <code>https://{{ ip }}/</code></p>
+
+<div class="card" style="margin:14px 0;">
+  <div class="row">
+    <button class="btn" hx-get="/api/discover" hx-target="#disc" hx-indicator="#spin">Scan LAN for cameras</button>
+    <span id="spin" class="muted" style="display:none;">Scanning…</span>
+  </div>
+  <div id="disc" class="grid" style="margin-top:12px;"></div>
+</div>
+
+<div class="card">
+  <h3>Set camera by RTSP URL</h3>
+  <p class="muted">Paste full RTSP, e.g. <code>rtsp://user:pass@10.0.0.42:554/cam/realmonitor?channel=1&subtype=0</code></p>
+  <div class="row">
+    <input id="rtsp" type="text" placeholder="rtsp://..." value="{{ current or '' }}">
+    <button class="btn" onclick="setManual()">Save & Switch</button>
+  </div>
+  <p class="muted" style="margin-top:8px;">Current: {{ current or '— none set —' }}</p>
+</div>
+
+<script>
+  document.body.addEventListener('htmx:beforeRequest', (e)=>{
+    if(e.target.id==='disc') document.querySelector('#spin').style.display='inline';
+  });
+  document.body.addEventListener('htmx:afterRequest', (e)=>{
+    if(e.target.id==='disc') document.querySelector('#spin').style.display='none';
+  });
+
+  document.addEventListener('htmx:afterOnLoad', (e) => {
+    if (e.detail.target.id === 'disc') {
+      const cams = JSON.parse(e.detail.xhr.responseText);
+      const el = e.detail.target;
+      if (!cams.length) { el.innerHTML = '<p class="muted">No ONVIF cameras found.</p>'; return; }
+      el.innerHTML = cams.map(c => `
+        <div class="card cam-card" id="card-${c.ip.replace(/\\./g,'-')}">
+          <div>${c.snapshot ? `<img loading="lazy" id="thumb-${c.ip.replace(/\\./g,'-')}" src="${c.snapshot}">` : `<div class="muted" style="width:320px;height:180px;display:flex;align-items:center;justify-content:center;">No preview</div>`}</div>
+          <div style="margin-top:8px; font-size:14px;">
+            <div><b>${c.model}</b></div>
+            <div class="muted iptext">${c.ip}</div>
+            <div style="margin-top:6px;" id="controls-${c.ip.replace(/\\./g,'-')}">
+              <button class="btn small" onclick="useCam('${c.rtsp_url || ''}','${c.ip}')">Use this camera</button>
+              <button class="btn small" onclick="identifyProgress('${c.ip}')">Identify</button>
+              <button class="btn small" onclick="testCredsPrompt('${c.ip}')">Test creds</button>
+            </div>
+            <div id="progress-${c.ip.replace(/\\./g,'-')}" style="margin-top:8px; display:none;">
+              <div style="background:#0c0f14;border:1px solid #2a3040;border-radius:8px;overflow:hidden;width:320px;height:12px;">
+                <div id="bar-${c.ip.replace(/\\./g,'-')}" style="height:12px;width:0%;background:#1f6feb;"></div>
+              </div>
+              <div id="lines-${c.ip.replace(/\\./g,'-')}" class="muted" style="font-size:12px;margin-top:6px;white-space:pre-line;"></div>
+            </div>
+            <div id="report-${c.ip.replace(/\\./g,'-')}" class="muted" style="margin-top:8px;font-size:13px;"></div>
+          </div>
+        </div>`).join('');
+    }
+  });
+
+  async function useCam(rtsp, ip){
+    if(!rtsp){
+      rtsp = prompt("RTSP URL for "+ip+" (e.g. rtsp://user:pass@"+ip+":554/...):");
+      if(!rtsp) return;
+    }
+    await fetch('/api/set_rtsp', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({rtsp_url: rtsp})});
+    alert('Camera set. Player will restart.');
+  }
+
+  async function identifyProgress(ip){
+    const cardId = ip.replace(/\\./g,'-');
+    const pWrap = document.getElementById('progress-' + cardId);
+    const bar = document.getElementById('bar-' + cardId);
+    const lines = document.getElementById('lines-' + cardId);
+    const reportEl = document.getElementById('report-' + cardId);
+    pWrap.style.display = 'block';
+    bar.style.width = '0%';
+    lines.textContent = 'Starting…';
+
+    const res = await fetch('/api/identify_start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ip})});
+    const { job_id } = await res.json();
+    if(!job_id){ lines.textContent = 'Failed to start job'; return; }
+
+    const timer = setInterval(async ()=>{
+      try{
+        const sres = await fetch('/api/job_status/' + job_id);
+        const st = await sres.json();
+        if(st.error){ lines.textContent = 'Error: ' + st.error; clearInterval(timer); return; }
+        bar.style.width = (st.progress || 0) + '%';
+        if(st.lines && st.lines.length){ lines.textContent = st.lines.join('\\n'); }
+        if(st.status === 'done'){
+          clearInterval(timer);
+          const j = st.result || {};
+          let txt = '';
+          if(j.open_ports && j.open_ports.length) txt += 'Open ports: ' + j.open_ports.join(', ') + '\\n';
+          if(j.likely_vendors && j.likely_vendors.length) txt += 'Likely: ' + j.likely_vendors.join(', ') + '\\n';
+          if(j.http_snapshots && j.http_snapshots.length){
+            txt += 'Snapshots: ' + j.http_snapshots.map(s => s.split('/').pop()).join(', ') + '\\n';
+            const thumbEl = document.getElementById('thumb-' + cardId);
+            if(thumbEl){
+              thumbEl.src = j.http_snapshots[0].replace('/opt/camstack/runtime', '/snaps') + '?t=' + Date.now();
+            }
+          }
+          if(j.rtsp_found && j.rtsp_found.length){
+            txt += 'RTSP: ' + j.rtsp_found.map(r=>r.url).join('; ') + '\\n';
+          }
+          reportEl.textContent = txt || 'No findings';
+        }
+        if(st.status === 'error'){
+          clearInterval(timer);
+          lines.textContent = 'Error: ' + (st.error || 'unknown');
+        }
+      }catch(e){
+        clearInterval(timer);
+        lines.textContent = 'Polling error: ' + e;
+      }
+    }, 800);
+  }
+
+  async function testCredsPrompt(ip){
+    const user = prompt("Username for " + ip + " (leave blank to cancel):");
+    if(!user) return;
+    const pass = prompt("Password for " + ip + " (will be used once to test):");
+    if(pass === null) return;
+    const cardId = ip.replace(/\\./g,'-');
+    const reportEl = document.getElementById('report-' + cardId);
+    reportEl.innerText = 'Testing creds…';
+    try{
+      const res = await fetch('/api/identify_start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ip, user, password: pass})});
+      const { job_id } = await res.json();
+      if(!job_id){ reportEl.innerText = 'Failed to start job'; return; }
+      const timer = setInterval(async ()=>{
+        const st = await (await fetch('/api/job_status/' + job_id)).json();
+        if(st.status === 'done'){
+          clearInterval(timer);
+          const j = st.result || {};
+          let txt = '';
+          if(j.http_snapshots && j.http_snapshots.length){
+            txt += 'Authenticated snapshots: ' + j.http_snapshots.map(s => s.split('/').pop()).join(', ') + '\\n';
+            const thumbEl = document.getElementById('thumb-' + cardId);
+            if(thumbEl){
+              thumbEl.src = j.http_snapshots[0].replace('/opt/camstack/runtime', '/snaps') + '?t=' + Date.now();
+            }
+          } else {
+            txt += 'No authenticated snapshots found.';
+          }
+          reportEl.innerText = txt;
+        }
+        if(st.status === 'error'){
+          clearInterval(timer);
+          reportEl.innerText = 'Error: ' + (st.error || 'unknown');
+        }
+      }, 900);
+    }catch(e){
+      reportEl.innerText = 'Test creds failed: ' + e;
+    }
+  }
+
+  async function setManual(){
+    const rtsp = document.getElementById('rtsp').value.trim();
+    if(!rtsp) { alert('Please enter an RTSP URL.'); return; }
+    await fetch('/api/set_rtsp', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({rtsp_url: rtsp})});
+    alert('Camera set. Player will restart.');
+  }
+</script>
+{% endblock %}

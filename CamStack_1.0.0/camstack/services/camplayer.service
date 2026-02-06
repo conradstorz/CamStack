@@ -1,0 +1,22 @@
+[Unit]
+Description=Fullscreen camera player (mpv) v1.0.0
+After=network-online.target camstack.service graphical.target
+Wants=network-online.target graphical.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/opt/camstack
+ExecStart=/opt/camstack/scripts/run_camplayer.sh
+Restart=always
+RestartSec=2
+TimeoutStartSec=30
+TimeoutStopSec=10
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+Environment=HOME=/home/pi
+
+[Install]
+WantedBy=multi-user.target

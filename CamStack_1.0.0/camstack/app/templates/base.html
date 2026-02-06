@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CamStack 1.0.0</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>
+    body { background:#0f1115; color:#e6e6e6; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .container { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
+    .btn { background:#1f6feb; color:white; border:none; padding:10px 14px; border-radius:10px; cursor:pointer; }
+    .btn.small { padding:6px 10px; font-size: 14px; }
+    .grid { display:flex; flex-wrap:wrap; gap:12px; }
+    .card { background:#161a22; border:1px solid #1f2430; border-radius:12px; padding:14px; }
+    .cam-card img { display:block; width:320px; height:180px; object-fit:cover; border-radius:10px; }
+    .muted { color:#9aa4b2; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    input[type=text] { background:#0c0f14; border:1px solid #2a3040; color:#e6e6e6; padding:10px; border-radius:10px; min-width:320px; }
+    code { background:#0c0f14; padding:2px 5px; border-radius:6px; border:1px solid #2a3040; }
+    small.version { color:#9aa4b2; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div style="display:flex;justify-content:space-between;flex-wrap:wrap;align-items:baseline;">
+      <h1 style="margin:0;">CamStack</h1>
+      <small class="version">v1.0.0</small>
+    </div>
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>
