@@ -45,7 +45,9 @@ case "$TLS_MODE" in
 esac
 
 echo "[*] Installing systemd services..."
-cp services/*.service /etc/systemd/system/
+for svc in services/*.service; do
+  ln -sf "/opt/camstack/$svc" "/etc/systemd/system/$(basename "$svc")"
+done
 systemctl daemon-reload
 systemctl enable camredirect.service camstack.service camplayer.service
 systemctl restart camredirect.service camstack.service camplayer.service
