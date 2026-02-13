@@ -90,14 +90,14 @@ def onvif_discover(timeout: int = 4) -> list[CamInfo]:
                 f"rtsp://{ip}:554/stream1",
             ]
             for test_rtsp in common_rtsp_patterns:
-                if snap_path:
-                    break
                 try:
-                    snap_path = str(_grab_frame(test_rtsp, ip))
-                    if not rtsp_url:
-                        rtsp_url = test_rtsp
-                    logger.debug(f"Snapshot captured from {test_rtsp}")
-                    break
+                    test_snap = _grab_frame(test_rtsp, ip)
+                    if test_snap:
+                        snap_path = str(test_snap)
+                        if not rtsp_url:
+                            rtsp_url = test_rtsp
+                        logger.debug(f"Snapshot captured from {test_rtsp}")
+                        break
                 except Exception:
                     continue
 

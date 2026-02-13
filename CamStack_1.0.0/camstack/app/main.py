@@ -50,12 +50,15 @@ def api_discover():
     cams = onvif_discover()
     payload = []
     for c in cams:
+        snap_url = f"/snaps/{Path(c.snapshot_path).name}" if c.snapshot_path else None
+        logger.debug(f"Camera {c.ip}: snapshot_path={c.snapshot_path}, snap_url={snap_url}")
         payload.append({
             "ip": c.ip,
             "model": c.model or "Unknown",
             "rtsp_url": c.rtsp_url,
-            "snapshot": f"/snaps/{Path(c.snapshot_path).name}" if c.snapshot_path else None,
+            "snapshot": snap_url,
         })
+    logger.info(f"Discover returning {len(payload)} cameras")
     return JSONResponse(payload)
 
 class SetUrl(BaseModel):
