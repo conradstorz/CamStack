@@ -80,6 +80,26 @@ def onvif_discover(timeout: int = 4) -> list[CamInfo]:
                             logger.debug(f"Frame grab failed for {ip}: {e}")
         except Exception as e:
             logger.warning(f"ONVIF detail fetch failed for {ip}: {e}")
+        
+        # If ONVIF failed completely, try common RTSP URLs
+        if not rtsp_url or not snap_path:
+            common_rtsp_patterns = [
+                f"rtsp://{ip}:554/rtsp/1",
+                f"rtsp://{ip}:8554/rtsp/1",
+                f"rtsp://{ip}/live.sdp",
+                f"rtsp://{ip}:554/stream1",
+            ]
+            for test_rtsp in common_rtsp_patterns:
+                if snap_path:
+                    break
+                try:
+                    snap_path = str(_grab_frame(test_rtsp, ip))
+                    if not rtsp_url:
+                        rtsp_url = test_rtsp
+                    logger.debug(f"Snapshot captured from {test_rtsp}")
+                    break
+                except Exception:
+                    continue
 
         cams.append(CamInfo(ip=ip, model=model, rtsp_url=rtsp_url, snapshot_path=snap_path))
 
