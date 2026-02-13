@@ -208,6 +208,5 @@ __marimo__/
 
 # CamStack runtime and local files
 CamStack_1.0.0/camstack/certs/
-CamStack_1.0.0/camstack/runtime/overlay.ass
-CamStack_1.0.0/camstack/runtime/reddit_cams.json
+CamStack_1.0.0/camstack/runtime/
 CamStack_1.0.0/camstack/uv.lock
