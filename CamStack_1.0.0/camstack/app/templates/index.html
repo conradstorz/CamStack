@@ -5,8 +5,8 @@
 
 <div class="card" style="margin:14px 0;">
   <div class="row">
-    <button class="btn" hx-get="/api/discover" hx-target="#disc" hx-indicator="#spin">Scan LAN for cameras</button>
-    <span id="spin" class="muted" style="display:none;">Scanning…</span>
+    <button id="scanBtn" class="btn" hx-get="/api/discover" hx-target="#disc" hx-indicator="#spin">Scan LAN for cameras</button>
+    <span id="spin" class="muted" style="display:none;"><strong>⏳ Scanning network...</strong></span>
   </div>
   <div id="disc" class="grid" style="margin-top:12px;"></div>
 </div>
@@ -23,10 +23,25 @@
 
 <script>
   document.body.addEventListener('htmx:beforeRequest', (e)=>{
-    if(e.target.id==='disc') document.querySelector('#spin').style.display='inline';
+    // e.detail.target is the target div where response will go
+    if(e.detail && e.detail.target && e.detail.target.id==='disc') {
+      const btn = document.getElementById('scanBtn');
+      const spinner = document.querySelector('#spin');
+      btn.disabled = true;
+      btn.style.opacity = '0.5';
+      spinner.style.display='inline';
+      spinner.style.fontWeight = 'bold';
+      spinner.style.color = '#1f6feb';
+    }
   });
   document.body.addEventListener('htmx:afterRequest', (e)=>{
-    if(e.target.id==='disc') document.querySelector('#spin').style.display='none';
+    if(e.detail && e.detail.target && e.detail.target.id==='disc') {
+      const btn = document.getElementById('scanBtn');
+      const spinner = document.querySelector('#spin');
+      btn.disabled = false;
+      btn.style.opacity = '1';
+      spinner.style.display='none';
+    }
   });
 
   document.addEventListener('htmx:afterOnLoad', (e) => {
@@ -86,24 +101,37 @@
         const st = await sres.json();
         if(st.error){ lines.textContent = 'Error: ' + st.error; clearInterval(timer); return; }
         bar.style.width = (st.progress || 0) + '%';
-        if(st.lines && st.lines.length){ lines.textContent = st.lines.join('\\n'); }
+        if(st.lines && st.lines.length){ lines.textContent = st.lines.join('\n'); }
         if(st.status === 'done'){
           clearInterval(timer);
           const j = st.result || {};
           let txt = '';
-          if(j.open_ports && j.open_ports.length) txt += 'Open ports: ' + j.open_ports.join(', ') + '\\n';
-          if(j.likely_vendors && j.likely_vendors.length) txt += 'Likely: ' + j.likely_vendors.join(', ') + '\\n';
+          if(j.open_ports && j.open_ports.length) txt += 'Open ports: ' + j.open_ports.join(', ') + '\n';
+          if(j.likely_vendors && j.likely_vendors.length) txt += 'Likely: ' + j.likely_vendors.join(', ') + '\n';
           if(j.http_snapshots && j.http_snapshots.length){
-            txt += 'Snapshots: ' + j.http_snapshots.map(s => s.split('/').pop()).join(', ') + '\\n';
+            txt += 'Snapshots: ' + j.http_snapshots.map(s => s.split('/').pop()).join(', ') + '\n';
             const thumbEl = document.getElementById('thumb-' + cardId);
             if(thumbEl){
               thumbEl.src = j.http_snapshots[0].replace('/opt/camstack/runtime', '/snaps') + '?t=' + Date.now();
             }
           }
           if(j.rtsp_found && j.rtsp_found.length){
-            txt += 'RTSP: ' + j.rtsp_found.map(r=>r.url).join('; ') + '\\n';
+            reportEl.textContent = txt || '';
+            const rtspDiv = document.createElement('div');
+            rtspDiv.style.marginTop = '8px';
+            rtspDiv.innerHTML = '<div style="margin-bottom:4px;"><b>RTSP Streams Found:</b></div>';
+            j.rtsp_found.forEach((r, idx) => {
+              const btn = document.createElement('button');
+              btn.className = 'btn small';
+              btn.textContent = `Use RTSP ${idx + 1}`;
+              btn.onclick = () => useCam(r.url, st.ip);
+              rtspDiv.appendChild(btn);
+              rtspDiv.appendChild(document.createTextNode(' '));
+            });
+            reportEl.appendChild(rtspDiv);
+          } else {
+            reportEl.textContent = txt || 'No findings';
           }
-          reportEl.textContent = txt || 'No findings';
         }
         if(st.status === 'error'){
           clearInterval(timer);
@@ -135,7 +163,7 @@
           const j = st.result || {};
           let txt = '';
           if(j.http_snapshots && j.http_snapshots.length){
-            txt += 'Authenticated snapshots: ' + j.http_snapshots.map(s => s.split('/').pop()).join(', ') + '\\n';
+            txt += 'Authenticated snapshots: ' + j.http_snapshots.map(s => s.split('/').pop()).join(', ') + '\n';
             const thumbEl = document.getElementById('thumb-' + cardId);
             if(thumbEl){
               thumbEl.src = j.http_snapshots[0].replace('/opt/camstack/runtime', '/snaps') + '?t=' + Date.now();
