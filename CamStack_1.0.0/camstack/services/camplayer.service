@@ -1,5 +1,5 @@
 [Unit]
-Description=Fullscreen camera player (mpv) v2.0.0
+Description=Fullscreen camera player (mpv) v2.0.1
 After=network-online.target camstack.service graphical.target
 Wants=network-online.target graphical.target
 

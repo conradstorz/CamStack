@@ -13,7 +13,7 @@ ensure_self_signed() {
   openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
     -keyout "$CERT_DIR/server.key" \
     -out "$CERT_DIR/server.crt" \
-    -subj "/CN=$(hostname -I | awk '{print $1}')/O=CamStack v2.0.0"
+    -subj "/CN=$(hostname -I | awk '{print $1}')/O=CamStack v2.0.1"
   chmod 600 "$CERT_DIR/server.key"
 }
 
@@ -25,7 +25,7 @@ ensure_private_ca_local() {
   echo "[*] Creating local CamStack Root CA (stored on this device)."
   openssl genrsa -out "$CA_DIR/rootCA.key" 4096
   openssl req -x509 -new -nodes -key "$CA_DIR/rootCA.key" -sha256 -days 3650 \
-    -out "$CA_DIR/rootCA.crt" -subj "/C=US/O=CamStackLAN/CN=CamStack Root CA v2.0.0"
+    -out "$CA_DIR/rootCA.crt" -subj "/C=US/O=CamStackLAN/CN=CamStack Root CA v2.0.1"
   chmod 600 "$CA_DIR/rootCA.key"
 }
 

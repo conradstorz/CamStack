@@ -13,7 +13,7 @@
 <div class="card" style="margin:14px 0;">
   <h3>Camera Management</h3>
   <div class="row" style="margin-bottom:12px;">
-    <button class="btn" onclick="syncCameras()">Sync from Network Scan</button>
+    <button class="btn" onclick="syncCameras()">Sync from Saved Discovery</button>
     <span id="syncResult" class="muted"></span>
   </div>
   <div id="cameraList">
@@ -121,30 +121,50 @@ async function loadCameras() {
     const res = await fetch('/api/motion/cameras');
     const data = await res.json();
     const cameras = data.cameras || {};
-    
-    if (Object.keys(cameras).length === 0) {
-      document.getElementById('cameraList').innerHTML = '<p class="muted">No cameras configured. Click "Sync from Network Scan" to add discovered cameras.</p>';
-      return;
-    }
+    const discovered = data.discovered || [];
+    const configuredSet = new Set(Object.keys(cameras));
+    const addable = discovered.filter(c => c.rtsp_url && !configuredSet.has(c.ip));
     
     let html = '<div style="display:grid;gap:12px;">';
-    for (const [camId, camData] of Object.entries(cameras)) {
-      html += `
-        <div class="card" style="display:flex;justify-content:space-between;align-items:center;padding:12px;">
-          <div>
-            <div><strong>${camId}</strong></div>
-            <div class="muted" style="font-size:13px;margin-top:4px;">${camData.rtsp_url}</div>
+
+    if (Object.keys(cameras).length === 0) {
+      html += '<p class="muted">No cameras configured yet.</p>';
+    } else {
+      for (const [camId, camData] of Object.entries(cameras)) {
+        html += `
+          <div class="card" style="display:flex;justify-content:space-between;align-items:center;padding:12px;">
+            <div>
+              <div><strong>${camId}</strong></div>
+              <div class="muted" style="font-size:13px;margin-top:4px;">${camData.rtsp_url}</div>
+            </div>
+            <div class="row" style="gap:8px;">
+              <label style="display:flex;align-items:center;gap:6px;">
+                <input type="checkbox" ${camData.enabled ? 'checked' : ''} onchange="toggleCamera('${camId}', this.checked)">
+                <span class="muted" style="font-size:14px;">Enabled</span>
+              </label>
+              <button class="btn small" style="background:#8b1500;" onclick="deleteCamera('${camId}')">Remove</button>
+            </div>
           </div>
-          <div class="row" style="gap:8px;">
-            <label style="display:flex;align-items:center;gap:6px;">
-              <input type="checkbox" ${camData.enabled ? 'checked' : ''} onchange="toggleCamera('${camId}', this.checked)">
-              <span class="muted" style="font-size:14px;">Enabled</span>
-            </label>
-            <button class="btn small" style="background:#8b1500;" onclick="deleteCamera('${camId}')">Remove</button>
-          </div>
-        </div>
-      `;
+        `;
+      }
     }
+
+    if (addable.length > 0) {
+      html += '<div class="card" style="padding:12px;"><div style="margin-bottom:8px;"><strong>Discovered Cameras Available to Add</strong></div>';
+      addable.forEach(cam => {
+        html += `
+          <div style="display:flex;justify-content:space-between;align-items:center;margin:8px 0;gap:10px;">
+            <div>
+              <div><strong>${cam.model || 'Unknown'}</strong> <span class="muted">${cam.ip}</span></div>
+              <div class="muted" style="font-size:12px;">${cam.rtsp_url}</div>
+            </div>
+            <button class="btn small" onclick="addDiscoveredCamera('${cam.ip}','${cam.rtsp_url.replace(/'/g, "&#39;")}')">Add</button>
+          </div>
+        `;
+      });
+      html += '</div>';
+    }
+
     html += '</div>';
     
     document.getElementById('cameraList').innerHTML = html;
@@ -155,7 +175,7 @@ async function loadCameras() {
 
 async function syncCameras() {
   const resultEl = document.getElementById('syncResult');
-  resultEl.textContent = 'Scanning network...';
+  resultEl.textContent = 'Syncing saved discovered cameras...';
   resultEl.style.color = '#9aa4b2';
   
   try {
@@ -163,7 +183,7 @@ async function syncCameras() {
     const data = await res.json();
     
     if (data.ok) {
-      resultEl.textContent = `✓ Synced ${data.added} new cameras (${data.total} total)`;
+      resultEl.textContent = `✓ Synced ${data.added} new, ${data.updated} updated (${data.total} total)`;
       resultEl.style.color = '#3fb950';
       await loadCameras();
       setTimeout(() => resultEl.textContent = '', 4000);
@@ -174,6 +194,30 @@ async function syncCameras() {
   } catch(e) {
     resultEl.textContent = `Error: ${e.message}`;
     resultEl.style.color = '#f85149';
+  }
+}
+
+async function addDiscoveredCamera(cameraId, rtspUrl) {
+  try {
+    const res = await fetch('/api/motion/cameras', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        camera_id: cameraId,
+        rtsp_url: rtspUrl,
+        enabled: true,
+      })
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      alert(`Error: ${err.error || 'Unknown error'}`);
+      return;
+    }
+
+    await loadCameras();
+  } catch(e) {
+    alert(`Error adding camera: ${e.message}`);
   }
 }
 

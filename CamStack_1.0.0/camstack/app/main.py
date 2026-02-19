@@ -7,6 +7,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from loguru import logger
 import subprocess, json, asyncio, uuid
+from datetime import datetime, timezone
 
 from .discovery import onvif_discover
 from .overlay_gen import write_overlay, get_first_ipv4
@@ -16,7 +17,8 @@ BASE = Path("/opt/camstack")
 RUNTIME = BASE / "runtime"
 CFG = RUNTIME / "config.json"
 SNAPS = RUNTIME / "snaps"
-VERSION = "2.0.0"
+DISCOVERED = RUNTIME / "discovered_cameras.json"
+VERSION = "2.0.1"
 
 app = FastAPI(title="CamStack", version=VERSION)
 app.mount("/snaps", StaticFiles(directory=str(SNAPS)), name="snaps")
@@ -26,8 +28,122 @@ templates = Jinja2Templates(directory=str(BASE / "app" / "templates"))
 def _startup():
     RUNTIME.mkdir(parents=True, exist_ok=True)
     SNAPS.mkdir(parents=True, exist_ok=True)
+    if not DISCOVERED.exists():
+        DISCOVERED.write_text(json.dumps({"last_scan": None, "cameras": []}, indent=2))
     write_overlay(False)
     logger.add(str(BASE / "logs" / "camstack.log"), rotation="10 MB")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _default_motion_cfg() -> dict:
+    return {
+        "enabled": False,
+        "snapshot_interval": 1.0,
+        "sensitivity": 12.0,
+        "frame_threshold": 3,
+        "rotation_interval": 20,
+        "cameras": {},
+    }
+
+
+def _load_discovered_store() -> dict:
+    if not DISCOVERED.exists():
+        return {"last_scan": None, "cameras": []}
+    try:
+        data = json.loads(DISCOVERED.read_text())
+        if isinstance(data, dict) and isinstance(data.get("cameras", []), list):
+            return {"last_scan": data.get("last_scan"), "cameras": data.get("cameras", [])}
+    except Exception:
+        pass
+    return {"last_scan": None, "cameras": []}
+
+
+def _save_discovered_store(store: dict) -> None:
+    DISCOVERED.write_text(json.dumps(store, indent=2))
+
+
+def _normalize_discovered_entry(entry: dict) -> dict:
+    return {
+        "ip": str(entry.get("ip", "")).strip(),
+        "model": entry.get("model") or "Unknown",
+        "rtsp_url": entry.get("rtsp_url"),
+        "snapshot": entry.get("snapshot"),
+        "first_seen": entry.get("first_seen"),
+        "last_seen": entry.get("last_seen"),
+    }
+
+
+def _merge_discovered(scanned: list[dict]) -> dict:
+    store = _load_discovered_store()
+    now = _now_iso()
+    by_ip: dict[str, dict] = {}
+
+    for raw in store.get("cameras", []):
+        cam = _normalize_discovered_entry(raw)
+        if cam["ip"]:
+            by_ip[cam["ip"]] = cam
+
+    for raw in scanned:
+        cam = _normalize_discovered_entry(raw)
+        ip = cam["ip"]
+        if not ip:
+            continue
+        prev = by_ip.get(ip, {})
+        merged = {
+            "ip": ip,
+            "model": cam["model"] or prev.get("model") or "Unknown",
+            "rtsp_url": cam.get("rtsp_url") or prev.get("rtsp_url"),
+            "snapshot": cam.get("snapshot") or prev.get("snapshot"),
+            "first_seen": prev.get("first_seen") or now,
+            "last_seen": now,
+        }
+        by_ip[ip] = merged
+
+    merged_cameras = sorted(by_ip.values(), key=lambda x: x.get("ip", ""))
+    store["cameras"] = merged_cameras
+    if scanned:
+        store["last_scan"] = now
+    _save_discovered_store(store)
+    return store
+
+
+def _sync_motion_from_discovered(cameras: list[dict]) -> dict:
+    cfg = json.loads(CFG.read_text()) if CFG.exists() else {}
+    motion_cfg = cfg.get("motion_detection", _default_motion_cfg())
+    motion_cams = motion_cfg.get("cameras", {})
+
+    added = 0
+    updated = 0
+    changed = False
+
+    for cam in cameras:
+        ip = str(cam.get("ip", "")).strip()
+        rtsp_url = cam.get("rtsp_url")
+        if not ip or not rtsp_url:
+            continue
+
+        if ip not in motion_cams:
+            motion_cams[ip] = {"rtsp_url": rtsp_url, "enabled": True}
+            added += 1
+            changed = True
+        elif motion_cams[ip].get("rtsp_url") != rtsp_url:
+            motion_cams[ip]["rtsp_url"] = rtsp_url
+            updated += 1
+            changed = True
+
+    motion_cfg["cameras"] = motion_cams
+    cfg["motion_detection"] = motion_cfg
+    if changed:
+        CFG.write_text(json.dumps(cfg, indent=2))
+
+    return {
+        "added": added,
+        "updated": updated,
+        "total": len(motion_cams),
+    }
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
@@ -57,19 +173,44 @@ def motion_page(request: Request):
 
 @app.get("/api/discover")
 def api_discover():
-    cams = onvif_discover()
-    payload = []
-    for c in cams:
-        snap_url = f"/snaps/{Path(c.snapshot_path).name}" if c.snapshot_path else None
-        logger.debug(f"Camera {c.ip}: snapshot_path={c.snapshot_path}, snap_url={snap_url}")
-        payload.append({
-            "ip": c.ip,
-            "model": c.model or "Unknown",
-            "rtsp_url": c.rtsp_url,
-            "snapshot": snap_url,
-        })
-    logger.info(f"Discover returning {len(payload)} cameras")
-    return JSONResponse(payload)
+    scanned_payload: list[dict] = []
+    try:
+        cams = onvif_discover()
+        for c in cams:
+            snap_url = f"/snaps/{Path(c.snapshot_path).name}" if c.snapshot_path else None
+            logger.debug(f"Camera {c.ip}: snapshot_path={c.snapshot_path}, snap_url={snap_url}")
+            scanned_payload.append({
+                "ip": c.ip,
+                "model": c.model or "Unknown",
+                "rtsp_url": c.rtsp_url,
+                "snapshot": snap_url,
+            })
+    except Exception as e:
+        logger.exception(f"Discovery scan failed: {e}")
+
+    store = _merge_discovered(scanned_payload)
+    sync = _sync_motion_from_discovered(store.get("cameras", []))
+
+    logger.info(
+        "Discover returning {} cameras (scanned={})",
+        len(store.get("cameras", [])),
+        len(scanned_payload),
+    )
+    return JSONResponse({
+        "cameras": store.get("cameras", []),
+        "last_scan": store.get("last_scan"),
+        "scanned": len(scanned_payload),
+        "motion_sync": sync,
+    })
+
+
+@app.get("/api/cameras")
+def api_cameras():
+    store = _load_discovered_store()
+    return JSONResponse({
+        "cameras": store.get("cameras", []),
+        "last_scan": store.get("last_scan"),
+    })
 
 class SetUrl(BaseModel):
     rtsp_url: str
@@ -196,14 +337,7 @@ def get_motion_config():
     
     try:
         cfg = json.loads(CFG.read_text())
-        motion_cfg = cfg.get("motion_detection", {
-            "enabled": False,
-            "snapshot_interval": 1.0,
-            "sensitivity": 12.0,
-            "frame_threshold": 3,
-            "rotation_interval": 20,
-            "cameras": {}
-        })
+        motion_cfg = cfg.get("motion_detection", _default_motion_cfg())
         return JSONResponse(motion_cfg)
     except Exception as e:
         logger.exception("Failed to load motion config")
@@ -229,14 +363,7 @@ def update_motion_config(req: MotionConfigUpdate):
             cfg = {}
         
         # Get or create motion config
-        motion_cfg = cfg.get("motion_detection", {
-            "enabled": False,
-            "snapshot_interval": 1.0,
-            "sensitivity": 12.0,
-            "frame_threshold": 3,
-            "rotation_interval": 20,
-            "cameras": {}
-        })
+        motion_cfg = cfg.get("motion_detection", _default_motion_cfg())
         
         # Update provided fields
         if req.enabled is not None:
@@ -268,9 +395,18 @@ def get_motion_cameras():
     """Get list of cameras configured for motion detection."""
     try:
         cfg = json.loads(CFG.read_text()) if CFG.exists() else {}
-        motion_cfg = cfg.get("motion_detection", {})
+        motion_cfg = cfg.get("motion_detection", _default_motion_cfg())
         cameras = motion_cfg.get("cameras", {})
-        return JSONResponse({"cameras": cameras})
+
+        discovered = _load_discovered_store().get("cameras", [])
+
+        if not cameras and discovered:
+            _sync_motion_from_discovered(discovered)
+            cfg = json.loads(CFG.read_text()) if CFG.exists() else {}
+            motion_cfg = cfg.get("motion_detection", _default_motion_cfg())
+            cameras = motion_cfg.get("cameras", {})
+
+        return JSONResponse({"cameras": cameras, "discovered": discovered})
     except Exception as e:
         logger.exception("Failed to get motion cameras")
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -294,14 +430,7 @@ def add_motion_camera(req: AddMotionCamera):
         
         # Get or create motion config
         if "motion_detection" not in cfg:
-            cfg["motion_detection"] = {
-                "enabled": False,
-                "snapshot_interval": 1.0,
-                "sensitivity": 12.0,
-                "frame_threshold": 3,
-                "rotation_interval": 20,
-                "cameras": {}
-            }
+            cfg["motion_detection"] = _default_motion_cfg()
         
         # Add camera
         cfg["motion_detection"]["cameras"][req.camera_id] = {
@@ -376,52 +505,19 @@ def delete_motion_camera(camera_id: str):
 
 @app.post("/api/motion/sync_discovered")
 def sync_discovered_cameras():
-    """Sync currently discovered cameras to motion detection config."""
+    """Sync persisted discovered cameras to motion detection config."""
     try:
-        # Discover cameras
-        cams = onvif_discover()
-        
-        # Load config
-        if CFG.exists():
-            cfg = json.loads(CFG.read_text())
-        else:
-            cfg = {}
-        
-        # Initialize motion config if needed
-        if "motion_detection" not in cfg:
-            cfg["motion_detection"] = {
-                "enabled": False,
-                "snapshot_interval": 1.0,
-                "sensitivity": 12.0,
-                "frame_threshold": 3,
-                "rotation_interval": 20,
-                "cameras": {}
-            }
-        
-        # Add discovered cameras (preserve existing enabled status)
-        existing_cameras = cfg["motion_detection"]["cameras"]
-        added = 0
-        
-        for cam in cams:
-            if cam.rtsp_url:  # Only add cameras with valid RTSP URLs
-                if cam.ip not in existing_cameras:
-                    existing_cameras[cam.ip] = {
-                        "rtsp_url": cam.rtsp_url,
-                        "enabled": True  # Enable new cameras by default
-                    }
-                    added += 1
-                else:
-                    # Update RTSP URL if camera already exists
-                    existing_cameras[cam.ip]["rtsp_url"] = cam.rtsp_url
-        
-        # Save
-        CFG.write_text(json.dumps(cfg, indent=2))
-        
+        store = _load_discovered_store()
+        discovered = store.get("cameras", [])
+        sync = _sync_motion_from_discovered(discovered)
+
         return JSONResponse({
             "ok": True,
-            "discovered": len(cams),
-            "added": added,
-            "total": len(existing_cameras)
+            "discovered": len(discovered),
+            "added": sync["added"],
+            "updated": sync["updated"],
+            "total": sync["total"],
+            "last_scan": store.get("last_scan"),
         })
     except Exception as e:
         logger.exception("Failed to sync discovered cameras")

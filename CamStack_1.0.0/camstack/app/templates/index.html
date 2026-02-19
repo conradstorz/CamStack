@@ -5,8 +5,9 @@
 
 <div class="card" style="margin:14px 0;">
   <div class="row">
-    <button id="scanBtn" class="btn" hx-get="/api/discover" hx-target="#disc" hx-indicator="#spin">Scan LAN for cameras</button>
+    <button id="scanBtn" class="btn" onclick="scanCameras()">Scan LAN for cameras</button>
     <span id="spin" class="muted" style="display:none;"><strong>⏳ Scanning network...</strong></span>
+    <span id="scanMeta" class="muted"></span>
   </div>
   <div id="disc" class="grid" style="margin-top:12px;"></div>
 </div>
@@ -22,34 +23,14 @@
 </div>
 
 <script>
-  document.body.addEventListener('htmx:beforeRequest', (e)=>{
-    // e.detail.target is the target div where response will go
-    if(e.detail && e.detail.target && e.detail.target.id==='disc') {
-      const btn = document.getElementById('scanBtn');
-      const spinner = document.querySelector('#spin');
-      btn.disabled = true;
-      btn.style.opacity = '0.5';
-      spinner.style.display='inline';
-      spinner.style.fontWeight = 'bold';
-      spinner.style.color = '#1f6feb';
-    }
-  });
-  document.body.addEventListener('htmx:afterRequest', (e)=>{
-    if(e.detail && e.detail.target && e.detail.target.id==='disc') {
-      const btn = document.getElementById('scanBtn');
-      const spinner = document.querySelector('#spin');
-      btn.disabled = false;
-      btn.style.opacity = '1';
-      spinner.style.display='none';
-    }
+  window.addEventListener('DOMContentLoaded', async () => {
+    await loadSavedCameras();
   });
 
-  document.addEventListener('htmx:afterOnLoad', (e) => {
-    if (e.detail.target.id === 'disc') {
-      const cams = JSON.parse(e.detail.xhr.responseText);
-      const el = e.detail.target;
-      if (!cams.length) { el.innerHTML = '<p class="muted">No ONVIF cameras found.</p>'; return; }
-      el.innerHTML = cams.map(c => `
+  function renderCameras(cams){
+    const el = document.getElementById('disc');
+    if (!cams.length) { el.innerHTML = '<p class="muted">No saved cameras yet. Click "Scan LAN for cameras".</p>'; return; }
+    el.innerHTML = cams.map(c => `
         <div class="card cam-card" id="card-${c.ip.replace(/\\./g,'-')}">
           <div>${c.snapshot ? `<img loading="lazy" id="thumb-${c.ip.replace(/\\./g,'-')}" src="${c.snapshot}">` : `<div class="muted" style="width:320px;height:180px;display:flex;align-items:center;justify-content:center;">No preview</div>`}</div>
           <div style="margin-top:8px; font-size:14px;">
@@ -69,8 +50,54 @@
             <div id="report-${c.ip.replace(/\\./g,'-')}" class="muted" style="margin-top:8px;font-size:13px;"></div>
           </div>
         </div>`).join('');
+  }
+
+  function setScanState(scanning){
+    const btn = document.getElementById('scanBtn');
+    const spinner = document.getElementById('spin');
+    btn.disabled = scanning;
+    btn.style.opacity = scanning ? '0.5' : '1';
+    spinner.style.display = scanning ? 'inline' : 'none';
+    spinner.style.fontWeight = 'bold';
+    spinner.style.color = '#1f6feb';
+  }
+
+  function renderScanMeta(lastScan){
+    const meta = document.getElementById('scanMeta');
+    if(!lastScan){
+      meta.textContent = '';
+      return;
     }
-  });
+    const d = new Date(lastScan);
+    meta.textContent = `Last scan: ${d.toLocaleString()}`;
+  }
+
+  async function loadSavedCameras(){
+    try{
+      const res = await fetch('/api/cameras');
+      const payload = await res.json();
+      const cams = payload.cameras || [];
+      renderCameras(cams);
+      renderScanMeta(payload.last_scan);
+    }catch(e){
+      document.getElementById('disc').innerHTML = `<p style="color:#f85149;">Failed to load saved cameras: ${e.message}</p>`;
+    }
+  }
+
+  async function scanCameras(){
+    setScanState(true);
+    try{
+      const res = await fetch('/api/discover');
+      const payload = await res.json();
+      const cams = payload.cameras || [];
+      renderCameras(cams);
+      renderScanMeta(payload.last_scan);
+    }catch(e){
+      alert('Scan failed: ' + e.message);
+    }finally{
+      setScanState(false);
+    }
+  }
 
   async function useCam(rtsp, ip){
     if(!rtsp){

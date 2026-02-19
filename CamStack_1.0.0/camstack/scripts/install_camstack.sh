@@ -53,7 +53,7 @@ systemctl enable camredirect.service camstack.service camplayer.service
 systemctl restart camredirect.service camstack.service camplayer.service
 
 echo
-echo "[✓] CamStack 2.0.0 is up."
+echo "[✓] CamStack 2.0.1 is up."
 echo "    HTTPS Admin UI: https://$(hostname -I | awk '{print $1}')/"
 if [ "$TLS_MODE" = "selfsigned" ]; then
   echo "    (Self-signed cert — browser will warn until you trust it.)"

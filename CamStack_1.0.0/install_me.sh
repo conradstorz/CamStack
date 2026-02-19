@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# CamStack 2.0.0 Development-Mode Installer
+# CamStack 2.0.1 Development-Mode Installer
 #
 # This installer creates SYMLINKS instead of copying files, enabling live development:
 #   - /opt/camstack -> symlink to source directory (this repository)
@@ -38,7 +38,7 @@ DST="/opt/camstack"
 
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════════════╗"
-echo "║              CamStack 2.0.0 Development Mode Installer                ║"
+echo "║              CamStack 2.0.1 Development Mode Installer                ║"
 echo "╚═══════════════════════════════════════════════════════════════════════╝"
 echo ""
 echo "Installation will create symlinks (not copy files) to enable live development."

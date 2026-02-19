@@ -1,4 +1,4 @@
-# CamStack 2.0.0
+# CamStack 2.0.1
 
 CamStack is a self-contained, offline, single-camera display appliance for x86 thin clients / mini PCs.
 
@@ -26,11 +26,11 @@ CamStack is a self-contained, offline, single-camera display appliance for x86 t
 
 ## Install
 
-1. Copy `CamStack_2.0.0.zip` to your Ubuntu box.
+1. Copy `CamStack_2.0.1.zip` to your Ubuntu box.
 2. Run:
 
-  unzip CamStack_2.0.0.zip
-  cd CamStack_2.0.0
+  unzip CamStack_2.0.1.zip
+  cd CamStack_2.0.1
    sudo bash install_me.sh
 
 The installer:
@@ -59,7 +59,7 @@ You'll see a browser warning for the self-signed cert. Continue past it and you'
 
 ## Version / Changelog
 
-### 2.0.0
+### 2.0.1
 - First public cut.
 - Appliance-style boot.
 - HTTPS by default (self-signed).
