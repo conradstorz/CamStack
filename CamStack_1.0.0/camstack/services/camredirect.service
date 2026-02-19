@@ -1,5 +1,5 @@
 [Unit]
-Description=HTTP->HTTPS redirector (port 80) v1.0.0
+Description=HTTP->HTTPS redirector (port 80) v2.0.0
 After=network-online.target
 Wants=network-online.target
 

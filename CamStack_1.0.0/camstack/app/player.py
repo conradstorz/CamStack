@@ -30,8 +30,15 @@ class StillFrameDisplay:
         self._tk = tk
         self._root = tk.Tk()
         self._root.configure(bg="black")
+        screen_w = self._root.winfo_screenwidth()
+        screen_h = self._root.winfo_screenheight()
+        self._root.geometry(f"{screen_w}x{screen_h}+0+0")
         self._root.attributes("-fullscreen", True)
         self._root.attributes("-topmost", True)
+        try:
+            self._root.state("zoomed")
+        except Exception:
+            pass
         self._root.config(cursor="none")
         self._root.bind("<Escape>", lambda _e: None)
 
@@ -39,16 +46,32 @@ class StillFrameDisplay:
         self._label.pack(fill="both", expand=True)
 
         self._photo = None
-        self._width = self._root.winfo_screenwidth()
-        self._height = self._root.winfo_screenheight()
+        self._width = screen_w
+        self._height = screen_h
         self._alive = True
         self._root.update_idletasks()
         self._root.update()
+        self._refresh_display_size()
+
+    def _refresh_display_size(self) -> None:
+        label_w = self._label.winfo_width()
+        label_h = self._label.winfo_height()
+        root_w = self._root.winfo_width()
+        root_h = self._root.winfo_height()
+
+        new_w = label_w if label_w > 1 else root_w
+        new_h = label_h if label_h > 1 else root_h
+
+        if new_w > 1:
+            self._width = new_w
+        if new_h > 1:
+            self._height = new_h
 
     def show_image(self, path: Path) -> bool:
         if not self._alive:
             return False
         try:
+            self._refresh_display_size()
             frame = Image.open(path).convert("RGB")
             src_w, src_h = frame.size
             if src_w <= 0 or src_h <= 0:
@@ -80,6 +103,7 @@ class StillFrameDisplay:
         try:
             self._root.update_idletasks()
             self._root.update()
+            self._refresh_display_size()
             return True
         except Exception:
             self._alive = False

@@ -1,5 +1,5 @@
 [Unit]
-Description=CamStack FastAPI (HTTPS 443) v1.0.0
+Description=CamStack FastAPI (HTTPS 443) v2.0.0
 After=network-online.target
 Wants=network-online.target
 

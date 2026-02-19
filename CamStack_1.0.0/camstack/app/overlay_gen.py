@@ -5,7 +5,7 @@ import psutil, socket
 
 RUNTIME = Path("/opt/camstack/runtime")
 OVERLAY = RUNTIME / "overlay.ass"
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 def get_first_ipv4() -> str:
     for name, addrs in psutil.net_if_addrs().items():
