@@ -50,11 +50,22 @@ class StillFrameDisplay:
             return False
         try:
             frame = Image.open(path).convert("RGB")
-            frame.thumbnail((self._width, self._height), Image.Resampling.LANCZOS)
-            canvas = Image.new("RGB", (self._width, self._height), "black")
-            left = (self._width - frame.width) // 2
-            top = (self._height - frame.height) // 2
-            canvas.paste(frame, (left, top))
+            src_w, src_h = frame.size
+            if src_w <= 0 or src_h <= 0:
+                return False
+
+            scale = max(self._width / src_w, self._height / src_h)
+            scaled_w = max(1, int(round(src_w * scale)))
+            scaled_h = max(1, int(round(src_h * scale)))
+
+            resized = frame.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+
+            left = max(0, (scaled_w - self._width) // 2)
+            top = max(0, (scaled_h - self._height) // 2)
+            right = left + self._width
+            bottom = top + self._height
+
+            canvas = resized.crop((left, top, right, bottom))
             self._photo = ImageTk.PhotoImage(canvas)
             self._label.configure(image=self._photo)
             self.pump()
