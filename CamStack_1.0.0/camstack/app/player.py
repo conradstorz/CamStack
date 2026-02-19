@@ -1,7 +1,8 @@
 from __future__ import annotations
 from pathlib import Path
-import subprocess, json
+import subprocess, json, time, signal, threading, os
 from dataclasses import dataclass
+from typing import Optional
 from loguru import logger
 from .overlay_gen import write_overlay
 from .fallback import (
@@ -11,6 +12,7 @@ from .fallback import (
     load_cached_stream,
     save_cached_stream,
 )
+from .motion_detector import MotionDetector
 
 BASE = Path("/opt/camstack")
 CFG = BASE / "runtime/config.json"
@@ -231,6 +233,13 @@ def launch_rtsp_with_watchdog() -> int:
     # Notify systemd we're ready
     subprocess.run(["systemd-notify", "--ready"], check=False, capture_output=True)
     
+    # Check if motion detection is enabled
+    motion_config = _load_motion_config()
+    if motion_config and motion_config.get("enabled", False):
+        logger.info("Motion detection enabled - launching multi-camera mode")
+        return launch_with_motion_detection(motion_config)
+    
+    # Standard single-camera mode
     # Launch player with watchdog monitoring
     url = None
     if CFG.exists():
@@ -249,3 +258,161 @@ def launch_rtsp_with_watchdog() -> int:
     # Fallback to nature cam with ranking refresh
     logger.warning("RTSP missing or failed; switching to fallback nature cam")
     return _fallback_loop()
+
+
+def _load_motion_config() -> Optional[dict]:
+    """Load motion detection configuration from config.json."""
+    if not CFG.exists():
+        return None
+    try:
+        cfg = json.loads(CFG.read_text())
+        return cfg.get("motion_detection")
+    except Exception as e:
+        logger.warning(f"Failed to load motion config: {e}")
+        return None
+
+
+def launch_with_motion_detection(motion_config: dict) -> int:
+    """
+    Launch multi-camera player with motion-based switching.
+    
+    Monitors all configured cameras for motion and switches display
+    to the camera with highest motion intensity. Rotates through
+    cameras when no motion is detected.
+    """
+    logger.info("Starting motion-based multi-camera monitoring")
+    
+    # Extract configuration
+    snapshot_interval = motion_config.get("snapshot_interval", 1.0)
+    sensitivity = motion_config.get("sensitivity", 12.0)
+    frame_threshold = motion_config.get("frame_threshold", 3)
+    rotation_interval = motion_config.get("rotation_interval", 20)
+    cameras = motion_config.get("cameras", {})
+    
+    if not cameras:
+        logger.error("No cameras configured for motion detection")
+        return launch_rtsp_with_watchdog()  # Fall back to single camera mode
+    
+    # Initialize motion detector
+    detector = MotionDetector(
+        snapshot_interval=snapshot_interval,
+        sensitivity=sensitivity,
+        frame_threshold=frame_threshold,
+    )
+    
+    # Add all enabled cameras
+    enabled_cameras = []
+    for camera_id, cam_cfg in cameras.items():
+        if cam_cfg.get("enabled", True):
+            rtsp_url = cam_cfg.get("rtsp_url")
+            if rtsp_url:
+                detector.add_camera(camera_id, rtsp_url, enabled=True)
+                enabled_cameras.append((camera_id, rtsp_url))
+                logger.info(f"Added camera {camera_id} to rotation")
+    
+    if not enabled_cameras:
+        logger.error("No enabled cameras with RTSP URLs")
+        return 1
+    
+    # Start motion detection in background
+    detector.start_monitoring()
+    
+    # State tracking
+    current_camera_idx = 0
+    current_camera_id, current_rtsp_url = enabled_cameras[current_camera_idx]
+    last_rotation = time.monotonic()
+    last_motion_camera = None
+    motion_mode = False
+    
+    # Launch initial camera
+    write_overlay(False)
+    procs, primary, files = _spawn_player(current_rtsp_url)
+    logger.info(f"Displaying camera {current_camera_id}: {current_rtsp_url}")
+    
+    try:
+        while True:
+            now = time.monotonic()
+            
+            # Check for player crash
+            if primary.poll() is not None:
+                logger.warning(f"Player crashed for camera {current_camera_id}, advancing...")
+                _terminate_procs(procs)
+                _close_files(files)
+                
+                # Move to next camera
+                current_camera_idx = (current_camera_idx + 1) % len(enabled_cameras)
+                current_camera_id, current_rtsp_url = enabled_cameras[current_camera_idx]
+                last_rotation = now
+                
+                write_overlay(False)
+                procs, primary, files = _spawn_player(current_rtsp_url)
+                logger.info(f"Switched to camera {current_camera_id}")
+                time.sleep(2)
+                continue
+            
+            # Check for motion
+            motion_camera_id = detector.check_all_cameras()
+            
+            if motion_camera_id and motion_camera_id != current_camera_id:
+                # Motion detected on different camera - switch immediately
+                logger.info(f"Motion detected on camera {motion_camera_id}, switching...")
+                _terminate_procs(procs)
+                _close_files(files)
+                
+                # Find the camera
+                motion_rtsp_url = None
+                for i, (cam_id, rtsp_url) in enumerate(enabled_cameras):
+                    if cam_id == motion_camera_id:
+                        motion_rtsp_url = rtsp_url
+                        current_camera_idx = i
+                        break
+                
+                if motion_rtsp_url:
+                    current_camera_id = motion_camera_id
+                    current_rtsp_url = motion_rtsp_url
+                    last_motion_camera = motion_camera_id
+                    motion_mode = True
+                    last_rotation = now
+                    
+                    write_overlay(False)
+                    procs, primary, files = _spawn_player(current_rtsp_url)
+                    logger.info(f"Now displaying motion camera: {current_camera_id}")
+                
+            elif motion_camera_id == current_camera_id:
+                # Still motion on current camera - stay here
+                last_rotation = now
+                motion_mode = True
+                
+            elif motion_mode and not motion_camera_id:
+                # Motion stopped - resume rotation after a short delay
+                if now - last_rotation > 5:  # 5 second grace period
+                    logger.info("Motion stopped, resuming rotation")
+                    motion_mode = False
+                    last_rotation = now
+            
+            # Rotation logic (only when no motion)
+            if not motion_mode and (now - last_rotation) >= rotation_interval:
+                # Time to rotate to next camera
+                _terminate_procs(procs)
+                _close_files(files)
+                
+                current_camera_idx = (current_camera_idx + 1) % len(enabled_cameras)
+                current_camera_id, current_rtsp_url = enabled_cameras[current_camera_idx]
+                last_rotation = now
+                
+                write_overlay(False)
+                procs, primary, files = _spawn_player(current_rtsp_url)
+                logger.info(f"Rotated to camera {current_camera_id}")
+            
+            time.sleep(0.5)  # Check twice per second
+            
+    except KeyboardInterrupt:
+        logger.info("Motion detection interrupted by user")
+    except Exception as e:
+        logger.exception(f"Motion detection error: {e}")
+    finally:
+        detector.stop_monitoring()
+        _terminate_procs(procs)
+        _close_files(files)
+    
+    return 0

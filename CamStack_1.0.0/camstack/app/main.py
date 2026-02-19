@@ -45,6 +45,16 @@ def index(request: Request):
         "version": VERSION
     })
 
+
+@app.get("/motion", response_class=HTMLResponse)
+def motion_page(request: Request):
+    """Motion detection configuration page."""
+    return templates.TemplateResponse("motion.html", {
+        "request": request,
+        "version": VERSION
+    })
+
+
 @app.get("/api/discover")
 def api_discover():
     cams = onvif_discover()
@@ -166,4 +176,253 @@ def api_test_creds(req: TestCredsRequest):
         return JSONResponse(result)
     except Exception as e:
         logger.exception("test_creds failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# Motion Detection Configuration Management
+
+@app.get("/api/motion/config")
+def get_motion_config():
+    """Get current motion detection configuration."""
+    if not CFG.exists():
+        return JSONResponse({
+            "enabled": False,
+            "snapshot_interval": 1.0,
+            "sensitivity": 12.0,
+            "frame_threshold": 3,
+            "rotation_interval": 20,
+            "cameras": {}
+        })
+    
+    try:
+        cfg = json.loads(CFG.read_text())
+        motion_cfg = cfg.get("motion_detection", {
+            "enabled": False,
+            "snapshot_interval": 1.0,
+            "sensitivity": 12.0,
+            "frame_threshold": 3,
+            "rotation_interval": 20,
+            "cameras": {}
+        })
+        return JSONResponse(motion_cfg)
+    except Exception as e:
+        logger.exception("Failed to load motion config")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+class MotionConfigUpdate(BaseModel):
+    enabled: bool | None = None
+    snapshot_interval: float | None = None
+    sensitivity: float | None = None
+    frame_threshold: int | None = None
+    rotation_interval: int | None = None
+
+
+@app.post("/api/motion/config")
+def update_motion_config(req: MotionConfigUpdate):
+    """Update motion detection settings."""
+    try:
+        # Load existing config
+        if CFG.exists():
+            cfg = json.loads(CFG.read_text())
+        else:
+            cfg = {}
+        
+        # Get or create motion config
+        motion_cfg = cfg.get("motion_detection", {
+            "enabled": False,
+            "snapshot_interval": 1.0,
+            "sensitivity": 12.0,
+            "frame_threshold": 3,
+            "rotation_interval": 20,
+            "cameras": {}
+        })
+        
+        # Update provided fields
+        if req.enabled is not None:
+            motion_cfg["enabled"] = req.enabled
+        if req.snapshot_interval is not None:
+            motion_cfg["snapshot_interval"] = max(0.5, min(5.0, req.snapshot_interval))
+        if req.sensitivity is not None:
+            motion_cfg["sensitivity"] = max(1.0, min(30.0, req.sensitivity))
+        if req.frame_threshold is not None:
+            motion_cfg["frame_threshold"] = max(1, min(10, req.frame_threshold))
+        if req.rotation_interval is not None:
+            motion_cfg["rotation_interval"] = max(5, min(300, req.rotation_interval))
+        
+        # Save back
+        cfg["motion_detection"] = motion_cfg
+        CFG.write_text(json.dumps(cfg, indent=2))
+        
+        # Restart player service to apply changes
+        subprocess.run(["sudo", "systemctl", "restart", "camplayer.service"], check=False)
+        
+        return JSONResponse({"ok": True, "config": motion_cfg})
+    except Exception as e:
+        logger.exception("Failed to update motion config")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/motion/cameras")
+def get_motion_cameras():
+    """Get list of cameras configured for motion detection."""
+    try:
+        cfg = json.loads(CFG.read_text()) if CFG.exists() else {}
+        motion_cfg = cfg.get("motion_detection", {})
+        cameras = motion_cfg.get("cameras", {})
+        return JSONResponse({"cameras": cameras})
+    except Exception as e:
+        logger.exception("Failed to get motion cameras")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+class AddMotionCamera(BaseModel):
+    camera_id: str
+    rtsp_url: str
+    enabled: bool = True
+
+
+@app.post("/api/motion/cameras")
+def add_motion_camera(req: AddMotionCamera):
+    """Add a camera to motion detection monitoring."""
+    try:
+        # Load existing config
+        if CFG.exists():
+            cfg = json.loads(CFG.read_text())
+        else:
+            cfg = {}
+        
+        # Get or create motion config
+        if "motion_detection" not in cfg:
+            cfg["motion_detection"] = {
+                "enabled": False,
+                "snapshot_interval": 1.0,
+                "sensitivity": 12.0,
+                "frame_threshold": 3,
+                "rotation_interval": 20,
+                "cameras": {}
+            }
+        
+        # Add camera
+        cfg["motion_detection"]["cameras"][req.camera_id] = {
+            "rtsp_url": req.rtsp_url,
+            "enabled": req.enabled
+        }
+        
+        # Save
+        CFG.write_text(json.dumps(cfg, indent=2))
+        
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        logger.exception("Failed to add motion camera")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+class UpdateMotionCamera(BaseModel):
+    enabled: bool | None = None
+    rtsp_url: str | None = None
+
+
+@app.patch("/api/motion/cameras/{camera_id}")
+def update_motion_camera(camera_id: str, req: UpdateMotionCamera):
+    """Update a specific camera's motion detection settings."""
+    try:
+        if not CFG.exists():
+            return JSONResponse({"error": "No configuration found"}, status_code=404)
+        
+        cfg = json.loads(CFG.read_text())
+        motion_cfg = cfg.get("motion_detection", {})
+        cameras = motion_cfg.get("cameras", {})
+        
+        if camera_id not in cameras:
+            return JSONResponse({"error": "Camera not found"}, status_code=404)
+        
+        # Update fields
+        if req.enabled is not None:
+            cameras[camera_id]["enabled"] = req.enabled
+        if req.rtsp_url is not None:
+            cameras[camera_id]["rtsp_url"] = req.rtsp_url
+        
+        # Save
+        CFG.write_text(json.dumps(cfg, indent=2))
+        
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        logger.exception("Failed to update motion camera")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.delete("/api/motion/cameras/{camera_id}")
+def delete_motion_camera(camera_id: str):
+    """Remove a camera from motion detection."""
+    try:
+        if not CFG.exists():
+            return JSONResponse({"error": "No configuration found"}, status_code=404)
+        
+        cfg = json.loads(CFG.read_text())
+        motion_cfg = cfg.get("motion_detection", {})
+        cameras = motion_cfg.get("cameras", {})
+        
+        if camera_id in cameras:
+            del cameras[camera_id]
+            CFG.write_text(json.dumps(cfg, indent=2))
+            return JSONResponse({"ok": True})
+        else:
+            return JSONResponse({"error": "Camera not found"}, status_code=404)
+    except Exception as e:
+        logger.exception("Failed to delete motion camera")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/motion/sync_discovered")
+def sync_discovered_cameras():
+    """Sync currently discovered cameras to motion detection config."""
+    try:
+        # Discover cameras
+        cams = onvif_discover()
+        
+        # Load config
+        if CFG.exists():
+            cfg = json.loads(CFG.read_text())
+        else:
+            cfg = {}
+        
+        # Initialize motion config if needed
+        if "motion_detection" not in cfg:
+            cfg["motion_detection"] = {
+                "enabled": False,
+                "snapshot_interval": 1.0,
+                "sensitivity": 12.0,
+                "frame_threshold": 3,
+                "rotation_interval": 20,
+                "cameras": {}
+            }
+        
+        # Add discovered cameras (preserve existing enabled status)
+        existing_cameras = cfg["motion_detection"]["cameras"]
+        added = 0
+        
+        for cam in cams:
+            if cam.rtsp_url:  # Only add cameras with valid RTSP URLs
+                if cam.ip not in existing_cameras:
+                    existing_cameras[cam.ip] = {
+                        "rtsp_url": cam.rtsp_url,
+                        "enabled": True  # Enable new cameras by default
+                    }
+                    added += 1
+                else:
+                    # Update RTSP URL if camera already exists
+                    existing_cameras[cam.ip]["rtsp_url"] = cam.rtsp_url
+        
+        # Save
+        CFG.write_text(json.dumps(cfg, indent=2))
+        
+        return JSONResponse({
+            "ok": True,
+            "discovered": len(cams),
+            "added": added,
+            "total": len(existing_cameras)
+        })
+    except Exception as e:
+        logger.exception("Failed to sync discovered cameras")
         return JSONResponse({"error": str(e)}, status_code=500)

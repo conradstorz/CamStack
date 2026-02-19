@@ -1,0 +1,213 @@
+{% extends "base.html" %}
+{% block content %}
+
+<p class="muted">Configure multi-camera motion detection and automatic switching.</p>
+
+<div class="card" style="margin:14px 0;">
+  <h3>Motion Detection Settings</h3>
+  <div id="motionSettings">
+    <p class="muted">Loading...</p>
+  </div>
+</div>
+
+<div class="card" style="margin:14px 0;">
+  <h3>Camera Management</h3>
+  <div class="row" style="margin-bottom:12px;">
+    <button class="btn" onclick="syncCameras()">Sync from Network Scan</button>
+    <span id="syncResult" class="muted"></span>
+  </div>
+  <div id="cameraList">
+    <p class="muted">Loading...</p>
+  </div>
+</div>
+
+<script>
+// Load motion settings on page load
+window.addEventListener('DOMContentLoaded', async () => {
+  await loadMotionSettings();
+  await loadCameras();
+});
+
+async function loadMotionSettings() {
+  try {
+    const res = await fetch('/api/motion/config');
+    const config = await res.json();
+    
+    const html = `
+      <div style="margin-bottom:20px;">
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+          <input type="checkbox" id="motionEnabled" ${config.enabled ? 'checked' : ''} onchange="updateMotionSettings()">
+          <span><strong>Enable Motion Detection</strong></span>
+        </label>
+        <p class="muted" style="margin-left:28px;margin-top:-8px;">When enabled, player switches between cameras based on motion</p>
+      </div>
+      
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;">
+        <div>
+          <label style="display:block;margin-bottom:6px;"><strong>Snapshot Interval</strong></label>
+          <input type="number" id="snapshotInterval" value="${config.snapshot_interval}" min="0.5" max="5" step="0.5" style="width:100%;" onchange="updateMotionSettings()">
+          <p class="muted" style="font-size:13px;margin-top:4px;">Seconds between motion checks (0.5-5.0)</p>
+        </div>
+        
+        <div>
+          <label style="display:block;margin-bottom:6px;"><strong>Sensitivity</strong></label>
+          <input type="number" id="sensitivity" value="${config.sensitivity}" min="1" max="30" step="1" style="width:100%;" onchange="updateMotionSettings()">
+          <p class="muted" style="font-size:13px;margin-top:4px;">% pixel change (1=high, 30=low)</p>
+        </div>
+        
+        <div>
+          <label style="display:block;margin-bottom:6px;"><strong>Frame Threshold</strong></label>
+          <input type="number" id="frameThreshold" value="${config.frame_threshold}" min="1" max="10" step="1" style="width:100%;" onchange="updateMotionSettings()">
+          <p class="muted" style="font-size:13px;margin-top:4px;">Consecutive frames before switching</p>
+        </div>
+        
+        <div>
+          <label style="display:block;margin-bottom:6px;"><strong>Rotation Interval</strong></label>
+          <input type="number" id="rotationInterval" value="${config.rotation_interval}" min="5" max="300" step="5" style="width:100%;" onchange="updateMotionSettings()">
+          <p class="muted" style="font-size:13px;margin-top:4px;">Seconds between camera rotation (5-300)</p>
+        </div>
+      </div>
+      
+      <div id="updateStatus" class="muted" style="margin-top:12px;"></div>
+    `;
+    
+    document.getElementById('motionSettings').innerHTML = html;
+  } catch(e) {
+    document.getElementById('motionSettings').innerHTML = `<p style="color:#f85149;">Error loading settings: ${e.message}</p>`;
+  }
+}
+
+async function updateMotionSettings() {
+  const enabled = document.getElementById('motionEnabled').checked;
+  const snapshotInterval = parseFloat(document.getElementById('snapshotInterval').value);
+  const sensitivity = parseFloat(document.getElementById('sensitivity').value);
+  const frameThreshold = parseInt(document.getElementById('frameThreshold').value);
+  const rotationInterval = parseInt(document.getElementById('rotationInterval').value);
+  
+  const statusEl = document.getElementById('updateStatus');
+  statusEl.textContent = 'Saving...';
+  statusEl.style.color = '#9aa4b2';
+  
+  try {
+    const res = await fetch('/api/motion/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        enabled,
+        snapshot_interval: snapshotInterval,
+        sensitivity,
+        frame_threshold: frameThreshold,
+        rotation_interval: rotationInterval
+      })
+    });
+    
+    if (res.ok) {
+      statusEl.textContent = '✓ Settings saved. Player service restarting...';
+      statusEl.style.color = '#3fb950';
+      setTimeout(() => statusEl.textContent = '', 3000);
+    } else {
+      const err = await res.json();
+      statusEl.textContent = `Error: ${err.error || 'Unknown error'}`;
+      statusEl.style.color = '#f85149';
+    }
+  } catch(e) {
+    statusEl.textContent = `Error: ${e.message}`;
+    statusEl.style.color = '#f85149';
+  }
+}
+
+async function loadCameras() {
+  try {
+    const res = await fetch('/api/motion/cameras');
+    const data = await res.json();
+    const cameras = data.cameras || {};
+    
+    if (Object.keys(cameras).length === 0) {
+      document.getElementById('cameraList').innerHTML = '<p class="muted">No cameras configured. Click "Sync from Network Scan" to add discovered cameras.</p>';
+      return;
+    }
+    
+    let html = '<div style="display:grid;gap:12px;">';
+    for (const [camId, camData] of Object.entries(cameras)) {
+      html += `
+        <div class="card" style="display:flex;justify-content:space-between;align-items:center;padding:12px;">
+          <div>
+            <div><strong>${camId}</strong></div>
+            <div class="muted" style="font-size:13px;margin-top:4px;">${camData.rtsp_url}</div>
+          </div>
+          <div class="row" style="gap:8px;">
+            <label style="display:flex;align-items:center;gap:6px;">
+              <input type="checkbox" ${camData.enabled ? 'checked' : ''} onchange="toggleCamera('${camId}', this.checked)">
+              <span class="muted" style="font-size:14px;">Enabled</span>
+            </label>
+            <button class="btn small" style="background:#8b1500;" onclick="deleteCamera('${camId}')">Remove</button>
+          </div>
+        </div>
+      `;
+    }
+    html += '</div>';
+    
+    document.getElementById('cameraList').innerHTML = html;
+  } catch(e) {
+    document.getElementById('cameraList').innerHTML = `<p style="color:#f85149;">Error loading cameras: ${e.message}</p>`;
+  }
+}
+
+async function syncCameras() {
+  const resultEl = document.getElementById('syncResult');
+  resultEl.textContent = 'Scanning network...';
+  resultEl.style.color = '#9aa4b2';
+  
+  try {
+    const res = await fetch('/api/motion/sync_discovered', {method: 'POST'});
+    const data = await res.json();
+    
+    if (data.ok) {
+      resultEl.textContent = `✓ Synced ${data.added} new cameras (${data.total} total)`;
+      resultEl.style.color = '#3fb950';
+      await loadCameras();
+      setTimeout(() => resultEl.textContent = '', 4000);
+    } else {
+      resultEl.textContent = `Error: ${data.error || 'Unknown error'}`;
+      resultEl.style.color = '#f85149';
+    }
+  } catch(e) {
+    resultEl.textContent = `Error: ${e.message}`;
+    resultEl.style.color = '#f85149';
+  }
+}
+
+async function toggleCamera(camId, enabled) {
+  try {
+    await fetch(`/api/motion/cameras/${encodeURIComponent(camId)}`, {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled})
+    });
+  } catch(e) {
+    alert(`Error toggling camera: ${e.message}`);
+    await loadCameras();
+  }
+}
+
+async function deleteCamera(camId) {
+  if (!confirm(`Remove camera ${camId} from motion detection?`)) return;
+  
+  try {
+    const res = await fetch(`/api/motion/cameras/${encodeURIComponent(camId)}`, {
+      method: 'DELETE'
+    });
+    
+    if (res.ok) {
+      await loadCameras();
+    } else {
+      const err = await res.json();
+      alert(`Error: ${err.error || 'Unknown error'}`);
+    }
+  } catch(e) {
+    alert(`Error deleting camera: ${e.message}`);
+  }
+}
+</script>
+
+{% endblock %}

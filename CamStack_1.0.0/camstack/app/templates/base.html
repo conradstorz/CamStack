@@ -26,9 +26,15 @@
 </head>
 <body>
   <div class="container">
-    <div style="display:flex;justify-content:space-between;flex-wrap:wrap;align-items:baseline;">
+    <div style="display:flex;justify-content:space-between;flex-wrap:wrap;align-items:baseline;margin-bottom:20px;">
       <h1 style="margin:0;">CamStack</h1>
       <small class="version">v1.0.0</small>
+    </div>
+    <div class="card" style="margin-bottom:20px;">
+      <div class="row">
+        <a href="/" class="btn small">Camera Setup</a>
+        <a href="/motion" class="btn small">Motion Detection</a>
+      </div>
     </div>
     {% block content %}{% endblock %}
   </div>

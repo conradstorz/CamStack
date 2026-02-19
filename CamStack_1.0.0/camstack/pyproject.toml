@@ -13,6 +13,8 @@ dependencies = [
   "psutil",
   "requests",
   "starlette",
+  "numpy",
+  "pillow",
 ]
 
 [tool.uv]
