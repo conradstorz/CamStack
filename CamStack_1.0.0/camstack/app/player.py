@@ -4,6 +4,7 @@ import subprocess, json, time, signal, threading, os
 from dataclasses import dataclass
 from typing import Optional
 from loguru import logger
+from PIL import Image, ImageTk
 from .overlay_gen import write_overlay
 from .fallback import (
     get_featured_fallback_url,
@@ -17,6 +18,92 @@ from .motion_detector import MotionDetector
 BASE = Path("/opt/camstack")
 CFG = BASE / "runtime/config.json"
 OVL = BASE / "runtime/overlay.ass"
+SNAP_DIR = BASE / "runtime/snaps"
+
+
+class StillFrameDisplay:
+    """Persistent fullscreen still-frame renderer for HDMI output."""
+
+    def __init__(self):
+        import tkinter as tk
+
+        self._tk = tk
+        self._root = tk.Tk()
+        self._root.configure(bg="black")
+        self._root.attributes("-fullscreen", True)
+        self._root.attributes("-topmost", True)
+        self._root.config(cursor="none")
+        self._root.bind("<Escape>", lambda _e: None)
+
+        self._label = tk.Label(self._root, bg="black", borderwidth=0, highlightthickness=0)
+        self._label.pack(fill="both", expand=True)
+
+        self._photo = None
+        self._width = self._root.winfo_screenwidth()
+        self._height = self._root.winfo_screenheight()
+        self._alive = True
+        self._root.update_idletasks()
+        self._root.update()
+
+    def show_image(self, path: Path) -> bool:
+        if not self._alive:
+            return False
+        try:
+            frame = Image.open(path).convert("RGB")
+            frame.thumbnail((self._width, self._height), Image.Resampling.LANCZOS)
+            canvas = Image.new("RGB", (self._width, self._height), "black")
+            left = (self._width - frame.width) // 2
+            top = (self._height - frame.height) // 2
+            canvas.paste(frame, (left, top))
+            self._photo = ImageTk.PhotoImage(canvas)
+            self._label.configure(image=self._photo)
+            self.pump()
+            return True
+        except Exception as e:
+            logger.debug(f"Still-frame render failed for {path}: {e}")
+            return False
+
+    def pump(self) -> bool:
+        if not self._alive:
+            return False
+        try:
+            self._root.update_idletasks()
+            self._root.update()
+            return True
+        except Exception:
+            self._alive = False
+            return False
+
+    def close(self):
+        if not self._alive:
+            return
+        try:
+            self._root.destroy()
+        except Exception:
+            pass
+        self._alive = False
+
+
+def _safe_camera_id(camera_id: str) -> str:
+    return camera_id.replace(".", "_").replace(":", "_").replace("/", "_")
+
+
+def _grab_display_frame(rtsp_url: str, camera_id: str) -> Optional[Path]:
+    """Capture one display-quality still frame from RTSP stream."""
+    SNAP_DIR.mkdir(parents=True, exist_ok=True)
+    snap_path = SNAP_DIR / f"display_{_safe_camera_id(camera_id)}.jpg"
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-rtsp_transport", "tcp", "-i", rtsp_url,
+        "-frames:v", "1", "-q:v", "4", "-y", str(snap_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, timeout=4, capture_output=True)
+        if snap_path.exists() and snap_path.stat().st_size > 0:
+            return snap_path
+    except Exception as e:
+        logger.debug(f"Display frame capture failed for {camera_id}: {e}")
+    return None
 
 def run_player_once(url: str) -> int:
     write_overlay(False)
@@ -314,36 +401,54 @@ def launch_with_motion_detection(motion_config: dict) -> int:
         logger.error("No enabled cameras with RTSP URLs")
         return 1
     
-    # Start motion detection in background
-    detector.start_monitoring()
-    
     # State tracking
     current_camera_idx = 0
     current_camera_id, current_rtsp_url = enabled_cameras[current_camera_idx]
     last_rotation = time.monotonic()
     last_motion_camera = None
     motion_mode = False
+    display_interval = max(0.15, min(1.0, snapshot_interval))
+    last_display_update = 0.0
+    last_frame_path: Optional[Path] = None
+
+    try:
+        display = StillFrameDisplay()
+    except Exception as e:
+        logger.warning(f"Still-frame display unavailable, falling back to mpv switching: {e}")
+        display = None
     
-    # Launch initial camera
-    write_overlay(False)
-    procs, primary, files = _spawn_player(current_rtsp_url)
-    logger.info(f"Displaying camera {current_camera_id}: {current_rtsp_url}")
+    # Start motion detection background updates only when renderer is active.
+    detector.start_monitoring()
+
+    # Fallback path keeps previous behavior if GUI display cannot be created.
+    if display is None:
+        write_overlay(False)
+        procs, primary, files = _spawn_player(current_rtsp_url)
+        logger.info(f"Displaying camera {current_camera_id}: {current_rtsp_url}")
+    else:
+        logger.info(f"Displaying camera {current_camera_id} using still-frame renderer")
     
     try:
         while True:
             now = time.monotonic()
             
-            # Check for player crash
-            if primary.poll() is not None:
+            # Keep GUI responsive.
+            if display is not None and not display.pump():
+                logger.warning("Still-frame GUI closed, switching to mpv fallback")
+                display = None
+                write_overlay(False)
+                procs, primary, files = _spawn_player(current_rtsp_url)
+
+            # Check for player crash in fallback mode.
+            if display is None and primary.poll() is not None:
                 logger.warning(f"Player crashed for camera {current_camera_id}, advancing...")
                 _terminate_procs(procs)
                 _close_files(files)
-                
-                # Move to next camera
+
                 current_camera_idx = (current_camera_idx + 1) % len(enabled_cameras)
                 current_camera_id, current_rtsp_url = enabled_cameras[current_camera_idx]
                 last_rotation = now
-                
+
                 write_overlay(False)
                 procs, primary, files = _spawn_player(current_rtsp_url)
                 logger.info(f"Switched to camera {current_camera_id}")
@@ -356,8 +461,9 @@ def launch_with_motion_detection(motion_config: dict) -> int:
             if motion_camera_id and motion_camera_id != current_camera_id:
                 # Motion detected on different camera - switch immediately
                 logger.info(f"Motion detected on camera {motion_camera_id}, switching...")
-                _terminate_procs(procs)
-                _close_files(files)
+                if display is None:
+                    _terminate_procs(procs)
+                    _close_files(files)
                 
                 # Find the camera
                 motion_rtsp_url = None
@@ -373,9 +479,10 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                     last_motion_camera = motion_camera_id
                     motion_mode = True
                     last_rotation = now
-                    
-                    write_overlay(False)
-                    procs, primary, files = _spawn_player(current_rtsp_url)
+
+                    if display is None:
+                        write_overlay(False)
+                        procs, primary, files = _spawn_player(current_rtsp_url)
                     logger.info(f"Now displaying motion camera: {current_camera_id}")
                 
             elif motion_camera_id == current_camera_id:
@@ -393,18 +500,30 @@ def launch_with_motion_detection(motion_config: dict) -> int:
             # Rotation logic (only when no motion)
             if not motion_mode and (now - last_rotation) >= rotation_interval:
                 # Time to rotate to next camera
-                _terminate_procs(procs)
-                _close_files(files)
+                if display is None:
+                    _terminate_procs(procs)
+                    _close_files(files)
                 
                 current_camera_idx = (current_camera_idx + 1) % len(enabled_cameras)
                 current_camera_id, current_rtsp_url = enabled_cameras[current_camera_idx]
                 last_rotation = now
-                
-                write_overlay(False)
-                procs, primary, files = _spawn_player(current_rtsp_url)
+
+                if display is None:
+                    write_overlay(False)
+                    procs, primary, files = _spawn_player(current_rtsp_url)
                 logger.info(f"Rotated to camera {current_camera_id}")
+
+            # Render still frames when GUI mode is available.
+            if display is not None and (now - last_display_update) >= display_interval:
+                frame_path = _grab_display_frame(current_rtsp_url, current_camera_id)
+                if frame_path is not None:
+                    if display.show_image(frame_path):
+                        last_frame_path = frame_path
+                elif last_frame_path is not None:
+                    display.show_image(last_frame_path)
+                last_display_update = now
             
-            time.sleep(0.5)  # Check twice per second
+            time.sleep(0.05)
             
     except KeyboardInterrupt:
         logger.info("Motion detection interrupted by user")
@@ -412,7 +531,10 @@ def launch_with_motion_detection(motion_config: dict) -> int:
         logger.exception(f"Motion detection error: {e}")
     finally:
         detector.stop_monitoring()
-        _terminate_procs(procs)
-        _close_files(files)
+        if display is not None:
+            display.close()
+        else:
+            _terminate_procs(procs)
+            _close_files(files)
     
     return 0
