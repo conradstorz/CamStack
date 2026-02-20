@@ -40,6 +40,7 @@ class MotionDetector:
         snapshot_interval: float = 1.0,
         sensitivity: float = 12.0,
         frame_threshold: int = 3,
+        diff_threshold: int = 15,
         max_error_count: int = 5,
     ):
         """
@@ -49,17 +50,22 @@ class MotionDetector:
             snapshot_interval: Seconds between snapshots (0.5-2.0 recommended)
             sensitivity: Pixel change threshold percentage (1-30)
             frame_threshold: Consecutive frames with motion before triggering
+            diff_threshold: Per-pixel grayscale delta (0-255) considered "changed"
             max_error_count: Max errors before disabling a camera
         """
         self.snapshot_interval = snapshot_interval
         self.sensitivity = sensitivity / 100.0  # Convert to decimal
         self.frame_threshold = frame_threshold
+        self.diff_threshold = max(1, min(255, int(diff_threshold)))
         self.max_error_count = max_error_count
         
         self.cameras: dict[str, CameraMotionState] = {}
         self._lock = threading.RLock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._latest_best_camera: Optional[str] = None
+        self._latest_best_score: float = 0.0
+        self._latest_eval_time: float = 0.0
         
     def add_camera(self, camera_id: str, rtsp_url: str, enabled: bool = True):
         """Add a camera to motion monitoring."""
@@ -150,8 +156,7 @@ class MotionDetector:
         diff = np.abs(current_frame - cam_state.last_frame)
         
         # Calculate percentage of pixels that changed significantly
-        threshold_value = 30  # Grayscale units (0-255)
-        changed_pixels = np.sum(diff > threshold_value)
+        changed_pixels = np.sum(diff > self.diff_threshold)
         total_pixels = diff.size
         change_percentage = changed_pixels / total_pixels
         
@@ -178,6 +183,7 @@ class MotionDetector:
         with self._lock:
             best_camera = None
             best_score = 0.0
+            checked_any = False
             
             for cam_id, cam_state in self.cameras.items():
                 if not cam_state.enabled:
@@ -189,6 +195,7 @@ class MotionDetector:
                     continue
                 
                 cam_state.last_check = now
+                checked_any = True
                 
                 # Detect motion
                 motion_detected, score = self._detect_motion(cam_state)
@@ -202,8 +209,20 @@ class MotionDetector:
                             f"Camera {cam_id} motion: {cam_state.motion_frames} frames, "
                             f"score={score*100:.1f}%"
                         )
-            
-            return best_camera
+
+            # Only update cached decision when a real evaluation happened.
+            # If this call lands between intervals, return the previous fresh result
+            # instead of forcing a false "no motion" state.
+            if checked_any:
+                self._latest_best_camera = best_camera
+                self._latest_best_score = best_score
+                self._latest_eval_time = time.time()
+
+            hold_seconds = max(1.5, self.snapshot_interval * 2.0)
+            if self._latest_best_camera and (time.time() - self._latest_eval_time) <= hold_seconds:
+                return self._latest_best_camera
+
+            return None
     
     def get_camera_states(self) -> dict[str, dict]:
         """Get current state of all cameras for monitoring/debugging."""

@@ -19,6 +19,7 @@ BASE = Path("/opt/camstack")
 CFG = BASE / "runtime/config.json"
 OVL = BASE / "runtime/overlay.ass"
 SNAP_DIR = BASE / "runtime/snaps"
+DEFAULT_STILL = BASE / "runtime/default.jpg"
 
 
 class StillFrameDisplay:
@@ -32,13 +33,9 @@ class StillFrameDisplay:
         self._root.configure(bg="black")
         screen_w = self._root.winfo_screenwidth()
         screen_h = self._root.winfo_screenheight()
-        self._root.geometry(f"{screen_w}x{screen_h}+0+0")
-        self._root.attributes("-fullscreen", True)
-        self._root.attributes("-topmost", True)
-        try:
-            self._root.state("zoomed")
-        except Exception:
-            pass
+        self._screen_w = screen_w
+        self._screen_h = screen_h
+        self._enforce_fullscreen()
         self._root.config(cursor="none")
         self._root.bind("<Escape>", lambda _e: None)
 
@@ -51,7 +48,15 @@ class StillFrameDisplay:
         self._alive = True
         self._root.update_idletasks()
         self._root.update()
+        self._enforce_fullscreen()
         self._refresh_display_size()
+
+    def _enforce_fullscreen(self) -> None:
+        self._root.overrideredirect(True)
+        self._root.geometry(f"{self._screen_w}x{self._screen_h}+0+0")
+        self._root.attributes("-fullscreen", True)
+        self._root.attributes("-topmost", True)
+        self._root.lift()
 
     def _refresh_display_size(self) -> None:
         label_w = self._label.winfo_width()
@@ -71,6 +76,7 @@ class StillFrameDisplay:
         if not self._alive:
             return False
         try:
+            self._enforce_fullscreen()
             self._refresh_display_size()
             frame = Image.open(path).convert("RGB")
             src_w, src_h = frame.size
@@ -101,6 +107,7 @@ class StillFrameDisplay:
         if not self._alive:
             return False
         try:
+            self._enforce_fullscreen()
             self._root.update_idletasks()
             self._root.update()
             self._refresh_display_size()
@@ -139,6 +146,16 @@ def _grab_display_frame(rtsp_url: str, camera_id: str) -> Optional[Path]:
     except Exception as e:
         logger.debug(f"Display frame capture failed for {camera_id}: {e}")
     return None
+
+
+def _show_default_still(display: StillFrameDisplay) -> bool:
+    """Show operator-provided default fullscreen still, if available."""
+    try:
+        if DEFAULT_STILL.exists() and DEFAULT_STILL.stat().st_size > 0:
+            return display.show_image(DEFAULT_STILL)
+    except Exception as e:
+        logger.debug(f"Default still render failed: {e}")
+    return False
 
 def run_player_once(url: str) -> int:
     write_overlay(False)
@@ -445,12 +462,18 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     display_interval = max(0.15, min(1.0, snapshot_interval))
     last_display_update = 0.0
     last_frame_path: Optional[Path] = None
+    last_successful_frame_at = time.monotonic()
+    frame_fail_counts: dict[str, int] = {cam_id: 0 for cam_id, _ in enabled_cameras}
+    all_offline_fail_threshold = 1
+    offline_frame_timeout = max(12.0, (rotation_interval * len(enabled_cameras)) + 3.0)
 
     try:
         display = StillFrameDisplay()
     except Exception as e:
         logger.warning(f"Still-frame display unavailable, falling back to mpv switching: {e}")
         display = None
+    display_capable = display is not None
+    realtime_motion_mode = False
     
     # Start motion detection background updates only when renderer is active.
     detector.start_monitoring()
@@ -492,6 +515,40 @@ def launch_with_motion_detection(motion_config: dict) -> int:
             
             # Check for motion
             motion_camera_id = detector.check_all_cameras()
+
+            # If all monitored cameras have failed/been disabled, stop showing
+            # stale camera imagery and switch to nature fallback behavior.
+            camera_states = detector.get_camera_states()
+            all_cameras_offline = bool(camera_states) and all(
+                (not st.get("enabled", True)) for st in camera_states.values()
+            )
+            all_snapshots_failing = bool(frame_fail_counts) and all(
+                count >= all_offline_fail_threshold for count in frame_fail_counts.values()
+            )
+            frame_timeout_exceeded = (now - last_successful_frame_at) >= offline_frame_timeout
+
+            if all_cameras_offline or all_snapshots_failing or frame_timeout_exceeded:
+                logger.warning("All motion cameras appear offline; switching to fallback stream")
+                if display is not None:
+                    display.close()
+                    display = None
+                else:
+                    _terminate_procs(procs)
+                    _close_files(files)
+                return _fallback_loop()
+
+            # Still-frame mode is lightweight but cannot sustain high FPS.
+            # Switch to realtime player mode only while motion is active.
+            if display is not None and motion_camera_id and display_capable and not realtime_motion_mode:
+                logger.info(
+                    "Motion detected; switching to realtime playback mode "
+                    "for higher frame rate"
+                )
+                display.close()
+                display = None
+                write_overlay(False)
+                procs, primary, files = _spawn_player(current_rtsp_url)
+                realtime_motion_mode = True
             
             if motion_camera_id and motion_camera_id != current_camera_id:
                 # Motion detected on different camera - switch immediately
@@ -531,6 +588,26 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                     logger.info("Motion stopped, resuming rotation")
                     motion_mode = False
                     last_rotation = now
+
+                    # Return to still-frame mode after motion so idle rotation
+                    # does not tear down fullscreen video between cameras.
+                    if realtime_motion_mode and display_capable and display is None:
+                        try:
+                            display = StillFrameDisplay()
+                            _show_default_still(display)
+                            _terminate_procs(procs)
+                            _close_files(files)
+                            realtime_motion_mode = False
+                            logger.info("Returned to still-frame mode after motion")
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to restore still-frame mode; staying in realtime mode: "
+                                f"{e}"
+                            )
+                            _terminate_procs(procs)
+                            _close_files(files)
+                            write_overlay(False)
+                            procs, primary, files = _spawn_player(current_rtsp_url)
             
             # Rotation logic (only when no motion)
             if not motion_mode and (now - last_rotation) >= rotation_interval:
@@ -552,10 +629,14 @@ def launch_with_motion_detection(motion_config: dict) -> int:
             if display is not None and (now - last_display_update) >= display_interval:
                 frame_path = _grab_display_frame(current_rtsp_url, current_camera_id)
                 if frame_path is not None:
+                    frame_fail_counts[current_camera_id] = 0
+                    last_successful_frame_at = now
                     if display.show_image(frame_path):
                         last_frame_path = frame_path
-                elif last_frame_path is not None:
-                    display.show_image(last_frame_path)
+                else:
+                    frame_fail_counts[current_camera_id] = frame_fail_counts.get(current_camera_id, 0) + 1
+                    if last_frame_path is not None:
+                        display.show_image(last_frame_path)
                 last_display_update = now
             
             time.sleep(0.05)
