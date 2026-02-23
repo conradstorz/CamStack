@@ -14,6 +14,7 @@ from .fallback import (
     save_cached_stream,
 )
 from .motion_detector import MotionDetector
+from .motion_memory import MotionMemory, DEFAULT_CLIP_DURATION
 
 BASE = Path("/opt/camstack")
 CFG = BASE / "runtime/config.json"
@@ -128,6 +129,80 @@ class StillFrameDisplay:
 
 def _safe_camera_id(camera_id: str) -> str:
     return camera_id.replace(".", "_").replace(":", "_").replace("/", "_")
+
+
+def _annotate_frame(
+    src_path: Path,
+    text: str,
+    output_path: Optional[Path] = None,
+) -> Path:
+    """
+    Render *text* as a semi-transparent banner at the bottom of a JPEG frame
+    using PIL.  Returns *output_path* on success, *src_path* on any error so
+    the caller always gets a valid image path back.
+    """
+    from PIL import ImageDraw, ImageFont
+    try:
+        dest = output_path or src_path
+        img = Image.open(src_path).convert("RGB")
+        draw = ImageDraw.Draw(img, "RGBA")
+        w, h = img.size
+
+        font_size = max(18, h // 22)
+        try:
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size
+            )
+        except Exception:
+            font = ImageFont.load_default()
+
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        pad = 10
+
+        # Background pill centred at the bottom of the frame
+        rx0 = (w - tw) // 2 - pad
+        ry0 = h - th - pad * 3
+        rx1 = rx0 + tw + pad * 2
+        ry1 = h - pad
+        draw.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, fill=(0, 0, 0, 172))
+        draw.text(
+            ((w - tw) // 2, ry0 + pad // 2),
+            text,
+            font=font,
+            fill=(255, 220, 50, 255),   # warm amber
+        )
+        img.save(str(dest), "JPEG", quality=85)
+        return dest
+    except Exception as e:
+        logger.debug(f"Frame annotation failed: {e}")
+        return src_path
+
+
+def _play_motion_clip(
+    clip_path: Path,
+    osd_text: str,
+    duration: float,
+) -> subprocess.Popen:
+    """
+    Launch mpv to play a local motion-memory clip fullscreen.
+    The *osd_text* is shown as a persistent OSD message while the clip plays.
+    Returns the Popen object; caller is responsible for cleanup.
+    """
+    cmd = [
+        "mpv",
+        "--hwdec=no", "--fs", "--force-window=yes",
+        "--osc=no", "--no-input-default-bindings", "--no-border",
+        "--osd-level=2",
+        f"--osd-msg1={osd_text}",
+        "--osd-font-size=48",
+        "--osd-color=#FFFFDC",
+        "--osd-back-color=#AA000000",
+        f"--length={int(duration)}",
+        str(clip_path),
+    ]
+    return subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
 
 
 def _grab_display_frame(rtsp_url: str, camera_id: str) -> Optional[Path]:
@@ -453,6 +528,14 @@ def launch_with_motion_detection(motion_config: dict) -> int:
         logger.error("No enabled cameras with RTSP URLs")
         return 1
     
+    # Motion memory (NVR-like clip retention)
+    motion_memory = MotionMemory(
+        clip_duration=motion_config.get("clip_duration", DEFAULT_CLIP_DURATION)
+    )
+    prev_motion_camera_id: Optional[str] = None
+    # Lookup dict for fast url resolution during motion rising-edge handler
+    _camera_url_map: dict[str, str] = {cam_id: url for cam_id, url in enabled_cameras}
+
     # State tracking
     current_camera_idx = 0
     current_camera_id, current_rtsp_url = enabled_cameras[current_camera_idx]
@@ -515,6 +598,19 @@ def launch_with_motion_detection(motion_config: dict) -> int:
             
             # Check for motion
             motion_camera_id = detector.check_all_cameras()
+
+            # Rising-edge: a camera that was not firing motion just started.
+            # Trigger clip recording immediately so it captures the live event.
+            if motion_camera_id and motion_camera_id != prev_motion_camera_id:
+                cam_url_for_rec = _camera_url_map.get(motion_camera_id)
+                if cam_url_for_rec:
+                    cam_score = (
+                        detector.get_camera_states()
+                        .get(motion_camera_id, {})
+                        .get("motion_score", 0.0)
+                    ) / 100.0
+                    motion_memory.record_clip(motion_camera_id, cam_url_for_rec, cam_score)
+            prev_motion_camera_id = motion_camera_id
 
             # If all monitored cameras have failed/been disabled, stop showing
             # stale camera imagery and switch to nature fallback behavior.
@@ -615,15 +711,59 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                 if display is None:
                     _terminate_procs(procs)
                     _close_files(files)
-                
+
                 current_camera_idx = (current_camera_idx + 1) % len(enabled_cameras)
                 current_camera_id, current_rtsp_url = enabled_cameras[current_camera_idx]
                 last_rotation = now
+                last_frame_path = None  # invalidate stale cache for new camera
 
                 if display is None:
                     write_overlay(False)
                     procs, primary, files = _spawn_player(current_rtsp_url)
                 logger.info(f"Rotated to camera {current_camera_id}")
+
+                # --- Motion Memory: play last clip for this camera ---
+                # Only in still-frame mode so we don't fight mpv processes.
+                if display is not None:
+                    mem_entry = motion_memory.get_last_motion(current_camera_id)
+                    if mem_entry:
+                        clip_path = Path(mem_entry["clip_path"])
+                        ago_text = motion_memory.time_since_motion(current_camera_id) or ""
+                        osd_msg = f"{current_camera_id}  \u2022  Last motion: {ago_text}"
+                        logger.info(
+                            f"[MotionMemory] Playing last clip for {current_camera_id} "
+                            f"({ago_text}): {clip_path.name}"
+                        )
+                        # Temporarily suspend PIL display while clip plays
+                        display.close()
+                        display = None
+                        clip_proc = _play_motion_clip(
+                            clip_path, osd_msg, motion_memory.clip_duration
+                        )
+                        clip_deadline = (
+                            time.monotonic() + motion_memory.clip_duration + 2.0
+                        )
+                        # Poll for clip end or new motion while clip plays
+                        while (
+                            clip_proc.poll() is None
+                            and time.monotonic() < clip_deadline
+                        ):
+                            chk = detector.check_all_cameras()
+                            if chk:
+                                # New motion – abort clip, let main loop handle it
+                                motion_camera_id = chk
+                                break
+                            time.sleep(0.1)
+                        _terminate_proc(clip_proc)
+                        # Restore PIL display unless motion just fired
+                        if not motion_camera_id and display_capable:
+                            try:
+                                display = StillFrameDisplay()
+                            except Exception as exc:
+                                logger.warning(
+                                    f"Could not reopen still display after clip: {exc}"
+                                )
+                                display = None
 
             # Render still frames when GUI mode is available.
             if display is not None and (now - last_display_update) >= display_interval:
@@ -631,12 +771,28 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                 if frame_path is not None:
                     frame_fail_counts[current_camera_id] = 0
                     last_successful_frame_at = now
+                    # Annotate with motion-age text when memory is available
+                    ago = motion_memory.time_since_motion(current_camera_id)
+                    if ago:
+                        ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
+                        frame_path = _annotate_frame(frame_path, f"Last motion: {ago}", ann_path)
                     if display.show_image(frame_path):
                         last_frame_path = frame_path
                 else:
-                    frame_fail_counts[current_camera_id] = frame_fail_counts.get(current_camera_id, 0) + 1
+                    frame_fail_counts[current_camera_id] = (
+                        frame_fail_counts.get(current_camera_id, 0) + 1
+                    )
                     if last_frame_path is not None:
-                        display.show_image(last_frame_path)
+                        # Re-annotate the cached frame (age text changes every second)
+                        ago = motion_memory.time_since_motion(current_camera_id)
+                        if ago:
+                            ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
+                            show_path = _annotate_frame(
+                                last_frame_path, f"Last motion: {ago}", ann_path
+                            )
+                        else:
+                            show_path = last_frame_path
+                        display.show_image(show_path)
                 last_display_update = now
             
             time.sleep(0.05)
