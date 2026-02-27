@@ -23,10 +23,6 @@
 
 <script>
 // Load motion settings on page load
-window.addEventListener('DOMContentLoaded', async () => {
-  await loadMotionSettings();
-  await loadCameras();
-});
 
 async function loadMotionSettings() {
   try {
@@ -252,6 +248,88 @@ async function deleteCamera(camId) {
     alert(`Error deleting camera: ${e.message}`);
   }
 }
+
+// ── Motion Events ──────────────────────────────────────────────────────────
+
+let eventsRefreshTimer = null;
+
+async function loadMotionEvents() {
+  const el = document.getElementById('motionEvents');
+  try {
+    const res = await fetch('/api/motion/events');
+    const data = await res.json();
+    const events = data.events || [];
+
+    if (events.length === 0) {
+      el.innerHTML = '<p class="muted">No motion clips recorded yet.</p>';
+      return;
+    }
+
+    let html = '<div style="display:grid;gap:14px;">';
+    for (const ev of events) {
+      const score = ev.score != null ? (ev.score * 100).toFixed(1) + '%' : '—';
+      const ago = ev.ago || '—';
+      const clipId = 'clip_' + ev.camera_id.replace(/\./g, '_');
+      html += `
+        <div class="card" style="padding:14px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
+            <div>
+              <strong>${ev.camera_id}</strong>
+              <span class="muted" style="font-size:13px;margin-left:10px;">${ago}</span>
+            </div>
+            <div class="row" style="gap:8px;">
+              <span class="muted" style="font-size:12px;">score&nbsp;${score}</span>
+              ${ev.clip_url ? `<button class="btn small" onclick="toggleClip('${clipId}','${ev.clip_url}')">&#9654; Play</button>` : ''}
+            </div>
+          </div>
+          ${ev.clip_url ? `
+          <div id="${clipId}" style="display:none;margin-top:8px;">
+            <video controls style="width:100%;max-width:640px;border-radius:8px;background:#000;" preload="metadata">
+              <source src="${ev.clip_url}" type="video/mp4">
+            </video>
+          </div>` : '<span class="muted" style="font-size:13px;">No clip file</span>'}
+        </div>
+      `;
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = `<p style="color:#f85149;">Error loading events: ${e.message}</p>`;
+  }
+}
+
+function toggleClip(clipId, clipUrl) {
+  const el = document.getElementById(clipId);
+  if (!el) return;
+  if (el.style.display === 'none') {
+    el.style.display = '';
+    const video = el.querySelector('video');
+    if (video) video.play().catch(() => {});
+  } else {
+    el.style.display = 'none';
+    const video = el.querySelector('video');
+    if (video) { video.pause(); video.currentTime = 0; }
+  }
+}
+
+function startEventsAutoRefresh() {
+  loadMotionEvents();
+  eventsRefreshTimer = setInterval(loadMotionEvents, 15000);
+}
+
+window.addEventListener('DOMContentLoaded', async () => {
+  await loadMotionSettings();
+  await loadCameras();
+  startEventsAutoRefresh();
+});
 </script>
+
+<div class="card" style="margin:14px 0;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+    <h3 style="margin:0;">Motion Events</h3>
+    <button class="btn small" onclick="loadMotionEvents()">&#8635; Refresh</button>
+  </div>
+  <div id="motionEvents"><p class="muted">Loading...</p></div>
+</div>
 
 {% endblock %}

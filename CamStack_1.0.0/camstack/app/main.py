@@ -11,17 +11,21 @@ from datetime import datetime, timezone
 
 from .discovery import onvif_discover
 from .overlay_gen import write_overlay, get_first_ipv4
+from .motion_memory import MotionMemory, format_motion_age
 from . import identify_streams
 
 BASE = Path("/opt/camstack")
 RUNTIME = BASE / "runtime"
 CFG = RUNTIME / "config.json"
 SNAPS = RUNTIME / "snaps"
+CLIPS_DIR = RUNTIME / "clips"
 DISCOVERED = RUNTIME / "discovered_cameras.json"
 VERSION = "2.0.1"
 
 app = FastAPI(title="CamStack", version=VERSION)
 app.mount("/snaps", StaticFiles(directory=str(SNAPS)), name="snaps")
+CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/clips", StaticFiles(directory=str(CLIPS_DIR)), name="clips")
 templates = Jinja2Templates(directory=str(BASE / "app" / "templates"))
 
 @app.on_event("startup")
@@ -521,4 +525,29 @@ def sync_discovered_cameras():
         })
     except Exception as e:
         logger.exception("Failed to sync discovered cameras")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/motion/events")
+def get_motion_events():
+    """Return all recorded motion clips, newest first."""
+    try:
+        mm = MotionMemory()
+        entries = mm.all_entries()
+        events = []
+        for cam_id, entry in entries.items():
+            clip_path = entry.get("clip_path", "")
+            filename = Path(clip_path).name if clip_path else ""
+            events.append({
+                "camera_id": cam_id,
+                "clip_url": f"/clips/{filename}" if filename else None,
+                "filename": filename,
+                "timestamp": entry.get("timestamp"),
+                "score": entry.get("score"),
+                "ago": format_motion_age(entry["timestamp"]) if entry.get("timestamp") else None,
+            })
+        events.sort(key=lambda e: e["timestamp"] or 0, reverse=True)
+        return JSONResponse({"events": events, "total": len(events)})
+    except Exception as e:
+        logger.exception("Failed to get motion events")
         return JSONResponse({"error": str(e)}, status_code=500)

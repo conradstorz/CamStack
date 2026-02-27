@@ -21,6 +21,7 @@ CFG = BASE / "runtime/config.json"
 OVL = BASE / "runtime/overlay.ass"
 SNAP_DIR = BASE / "runtime/snaps"
 DEFAULT_STILL = BASE / "runtime/default.jpg"
+CAMERA_RECOVERED = 75   # sentinel: _fallback_loop returns this when cameras come back online
 
 
 class StillFrameDisplay:
@@ -318,8 +319,33 @@ def _close_files(files: list[object]) -> None:
         except Exception:
             pass
 
-def _fallback_loop() -> int:
+def _probe_any_rtsp(camera_urls: list[str], timeout: int = 5) -> bool:
+    """Return True if at least one RTSP URL responds with a valid video frame."""
+    for url in camera_urls:
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-rtsp_transport", "tcp",
+                    "-i", url,
+                    "-frames:v", "1",
+                    "-f", "null", "-",
+                ],
+                timeout=timeout,
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _fallback_loop(recover_urls: list[str] | None = None) -> int:
     import time
+
+    _RECOVERY_INTERVAL = 60   # seconds between camera probe attempts
+    last_recovery_check: float = 0.0   # zero forces an immediate first probe
 
     write_overlay(True)
     blocked: set[str] = set()
@@ -398,6 +424,16 @@ def _fallback_loop() -> int:
                 save_cached_stream(best)
             last_check = now
 
+        # Camera recovery probe: periodically test if live streams are reachable.
+        now = time.monotonic()
+        if recover_urls and (now - last_recovery_check) >= _RECOVERY_INTERVAL:
+            last_recovery_check = now
+            if _probe_any_rtsp(recover_urls):
+                logger.info("[Fallback] Camera(s) back online — returning to live mode")
+                _terminate_procs(procs)
+                _close_files(files)
+                return CAMERA_RECOVERED
+
         time.sleep(1)
 
 def launch_rtsp_then_fallback() -> int:
@@ -451,7 +487,12 @@ def launch_rtsp_with_watchdog() -> int:
     motion_config = _load_motion_config()
     if motion_config and motion_config.get("enabled", False):
         logger.info("Motion detection enabled - launching multi-camera mode")
-        return launch_with_motion_detection(motion_config)
+        while True:
+            rc = launch_with_motion_detection(motion_config)
+            if rc != CAMERA_RECOVERED:
+                return rc
+            logger.info("Cameras back online — re-entering motion detection mode")
+            motion_config = _load_motion_config() or motion_config
     
     # Standard single-camera mode
     # Launch player with watchdog monitoring
@@ -547,7 +588,7 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     last_frame_path: Optional[Path] = None
     last_successful_frame_at = time.monotonic()
     frame_fail_counts: dict[str, int] = {cam_id: 0 for cam_id, _ in enabled_cameras}
-    all_offline_fail_threshold = 1
+    all_offline_fail_threshold = 3
     offline_frame_timeout = max(12.0, (rotation_interval * len(enabled_cameras)) + 3.0)
 
     try:
@@ -631,7 +672,8 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                 else:
                     _terminate_procs(procs)
                     _close_files(files)
-                return _fallback_loop()
+                camera_urls = [url for _, url in enabled_cameras]
+                return _fallback_loop(recover_urls=camera_urls)
 
             # Still-frame mode is lightweight but cannot sustain high FPS.
             # Switch to realtime player mode only while motion is active.
