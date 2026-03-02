@@ -619,7 +619,7 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     
     # Extract configuration
     snapshot_interval = motion_config.get("snapshot_interval", 1.0)
-    sensitivity = motion_config.get("sensitivity", 2.0)
+    sensitivity = motion_config.get("sensitivity", 5.0)
     frame_threshold = motion_config.get("frame_threshold", 2)
     diff_threshold = motion_config.get("diff_threshold", 8)
     rotation_interval = motion_config.get("rotation_interval", 20)
