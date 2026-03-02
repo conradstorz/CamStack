@@ -127,6 +127,18 @@ class StillFrameDisplay:
             pass
         self._alive = False
 
+    def show_black(self) -> None:
+        """Fill the window with solid black (use before any transition)."""
+        if not self._alive:
+            return
+        try:
+            black = Image.new("RGB", (max(1, self._width), max(1, self._height)), (0, 0, 0))
+            self._photo = ImageTk.PhotoImage(black)
+            self._label.configure(image=self._photo)
+            self.pump()
+        except Exception as e:
+            logger.debug(f"show_black failed: {e}")
+
 
 def _safe_camera_id(camera_id: str) -> str:
     return camera_id.replace(".", "_").replace(":", "_").replace("/", "_")
@@ -181,29 +193,50 @@ def _annotate_frame(
         return src_path
 
 
-def _play_motion_clip(
+def _play_clip_as_stills(
     clip_path: Path,
-    osd_text: str,
-    duration: float,
-) -> subprocess.Popen:
+    display: "StillFrameDisplay",
+    annotation: str = "",
+    fps: int = 8,
+    abort_check=None,
+) -> None:
     """
-    Launch mpv to play a local motion-memory clip fullscreen.
-    The *osd_text* is shown as a persistent OSD message while the clip plays.
-    Returns the Popen object; caller is responsible for cleanup.
+    Decode a recorded mp4 clip to JPEG frames and render via StillFrameDisplay.
+    No mpv spawned. No window teardown. Desktop never exposed.
+    abort_check is an optional callable() -> bool; return True to stop early.
     """
-    cmd = [
-        "mpv",
-        "--hwdec=no", "--fs", "--force-window=yes",
-        "--osc=no", "--no-input-default-bindings", "--no-border",
-        "--osd-level=2",
-        f"--osd-msg1={osd_text}",
-        "--osd-font-size=48",
-        "--osd-color=#FFFFDC",
-        "--osd-back-color=#AA000000",
-        f"--length={int(duration)}",
-        str(clip_path),
-    ]
-    return subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+    import tempfile, shutil
+    tmp = Path(tempfile.mkdtemp(prefix="camclip_"))
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-i", str(clip_path),
+                "-r", str(fps),
+                str(tmp / "f%05d.jpg"),
+            ],
+            timeout=30,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            logger.warning(f"[ClipStills] ffmpeg decode failed for {clip_path.name}")
+            return
+        frames = sorted(tmp.glob("f*.jpg"))
+        if not frames:
+            logger.warning(f"[ClipStills] No frames decoded from {clip_path.name}")
+            return
+        frame_interval = 1.0 / fps
+        for frame in frames:
+            if abort_check and abort_check():
+                logger.debug("[ClipStills] Aborted early — live motion detected")
+                break
+            out = _annotate_frame(frame, annotation) if annotation else frame
+            display.show_image(out)
+            time.sleep(frame_interval)
+    except Exception as e:
+        logger.warning(f"[ClipStills] Error playing {clip_path.name}: {e}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _grab_display_frame(rtsp_url: str, camera_id: str) -> Optional[Path]:
@@ -527,6 +560,38 @@ def _load_motion_config() -> Optional[dict]:
         return None
 
 
+def _start_frame_grabbers(
+    cameras: list[tuple[str, str]],
+    interval: float,
+    stop_event: threading.Event,
+    cache: dict,
+) -> list[threading.Thread]:
+    """
+    Start one background ffmpeg frame-grab thread per camera.
+    Each thread writes ``(path, grab_timestamp)`` into *cache[camera_id]*.
+    Non-blocking: main loop reads from the cache without waiting on ffmpeg.
+    """
+    def _grabber(camera_id: str, rtsp_url: str) -> None:
+        while not stop_event.is_set():
+            path = _grab_display_frame(rtsp_url, camera_id)
+            if path is not None:
+                cache[camera_id] = (path, time.monotonic())
+            stop_event.wait(interval)  # interruptible sleep
+
+    threads = []
+    for camera_id, rtsp_url in cameras:
+        t = threading.Thread(
+            target=_grabber,
+            args=(camera_id, rtsp_url),
+            daemon=True,
+            name=f"grabber-{_safe_camera_id(camera_id)}",
+        )
+        t.start()
+        threads.append(t)
+        logger.debug(f"[Grabber] Started background frame grabber for {camera_id}")
+    return threads
+
+
 def launch_with_motion_detection(motion_config: dict) -> int:
     """
     Launch multi-camera player with motion-based switching.
@@ -597,12 +662,23 @@ def launch_with_motion_detection(motion_config: dict) -> int:
         logger.warning(f"Still-frame display unavailable, falling back to mpv switching: {e}")
         display = None
     display_capable = display is not None
-    realtime_motion_mode = False
-    
-    # Start motion detection background updates only when renderer is active.
-    detector.start_monitoring()
 
-    # Fallback path keeps previous behavior if GUI display cannot be created.
+    # Background frame cache: one grabber thread per camera pre-fetches frames
+    # so the main loop never blocks on ffmpeg RTSP calls.
+    # Cache entries: None initially, then (Path, grab_timestamp: float).
+    _frame_cache: dict[str, tuple[Path, float] | None] = {
+        cam_id: None for cam_id, _ in enabled_cameras
+    }
+    _grabber_stop = threading.Event()
+
+    # Start motion detection and, if the GUI is available, background grabbers.
+    detector.start_monitoring()
+    if display_capable:
+        _start_frame_grabbers(
+            enabled_cameras, display_interval, _grabber_stop, _frame_cache
+        )
+
+    # Fallback path: if tkinter unavailable use mpv per-camera (legacy mode).
     if display is None:
         write_overlay(False)
         procs, primary, files = _spawn_player(current_rtsp_url)
@@ -666,7 +742,9 @@ def launch_with_motion_detection(motion_config: dict) -> int:
 
             if all_cameras_offline or all_snapshots_failing or frame_timeout_exceeded:
                 logger.warning("All motion cameras appear offline; switching to fallback stream")
+                _grabber_stop.set()
                 if display is not None:
+                    display.show_black()  # black frame so desktop never flashes
                     display.close()
                     display = None
                 else:
@@ -675,19 +753,6 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                 camera_urls = [url for _, url in enabled_cameras]
                 return _fallback_loop(recover_urls=camera_urls)
 
-            # Still-frame mode is lightweight but cannot sustain high FPS.
-            # Switch to realtime player mode only while motion is active.
-            if display is not None and motion_camera_id and display_capable and not realtime_motion_mode:
-                logger.info(
-                    "Motion detected; switching to realtime playback mode "
-                    "for higher frame rate"
-                )
-                display.close()
-                display = None
-                write_overlay(False)
-                procs, primary, files = _spawn_player(current_rtsp_url)
-                realtime_motion_mode = True
-            
             if motion_camera_id and motion_camera_id != current_camera_id:
                 # Motion detected on different camera - switch immediately
                 logger.info(f"Motion detected on camera {motion_camera_id}, switching...")
@@ -726,26 +791,6 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                     logger.info("Motion stopped, resuming rotation")
                     motion_mode = False
                     last_rotation = now
-
-                    # Return to still-frame mode after motion so idle rotation
-                    # does not tear down fullscreen video between cameras.
-                    if realtime_motion_mode and display_capable and display is None:
-                        try:
-                            display = StillFrameDisplay()
-                            _show_default_still(display)
-                            _terminate_procs(procs)
-                            _close_files(files)
-                            realtime_motion_mode = False
-                            logger.info("Returned to still-frame mode after motion")
-                        except Exception as e:
-                            logger.warning(
-                                "Failed to restore still-frame mode; staying in realtime mode: "
-                                f"{e}"
-                            )
-                            _terminate_procs(procs)
-                            _close_files(files)
-                            write_overlay(False)
-                            procs, primary, files = _spawn_player(current_rtsp_url)
             
             # Rotation logic (only when no motion)
             if not motion_mode and (now - last_rotation) >= rotation_interval:
@@ -764,56 +809,42 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                     procs, primary, files = _spawn_player(current_rtsp_url)
                 logger.info(f"Rotated to camera {current_camera_id}")
 
-                # --- Motion Memory: play last clip for this camera ---
-                # Only in still-frame mode so we don't fight mpv processes.
+                # --- Motion Memory: show last clip as rapid still frames ---
+                # Window stays open throughout; desktop never exposed.
                 if display is not None:
                     mem_entry = motion_memory.get_last_motion(current_camera_id)
                     if mem_entry:
                         clip_path = Path(mem_entry["clip_path"])
                         ago_text = motion_memory.time_since_motion(current_camera_id) or ""
-                        osd_msg = f"{current_camera_id}  \u2022  Last motion: {ago_text}"
+                        annotation = f"{current_camera_id}  \u2022  Last motion: {ago_text}"
                         logger.info(
-                            f"[MotionMemory] Playing last clip for {current_camera_id} "
+                            f"[MotionMemory] Showing clip as stills for {current_camera_id} "
                             f"({ago_text}): {clip_path.name}"
                         )
-                        # Temporarily suspend PIL display while clip plays
-                        display.close()
-                        display = None
-                        clip_proc = _play_motion_clip(
-                            clip_path, osd_msg, motion_memory.clip_duration
+                        _play_clip_as_stills(
+                            clip_path,
+                            display,
+                            annotation=annotation,
+                            fps=8,
+                            abort_check=lambda: bool(detector.check_all_cameras()),
                         )
-                        clip_deadline = (
-                            time.monotonic() + motion_memory.clip_duration + 2.0
-                        )
-                        # Poll for clip end or new motion while clip plays
-                        while (
-                            clip_proc.poll() is None
-                            and time.monotonic() < clip_deadline
-                        ):
-                            chk = detector.check_all_cameras()
-                            if chk:
-                                # New motion – abort clip, let main loop handle it
-                                motion_camera_id = chk
-                                break
-                            time.sleep(0.1)
-                        _terminate_proc(clip_proc)
-                        # Restore PIL display unless motion just fired
-                        if not motion_camera_id and display_capable:
-                            try:
-                                display = StillFrameDisplay()
-                            except Exception as exc:
-                                logger.warning(
-                                    f"Could not reopen still display after clip: {exc}"
-                                )
-                                display = None
+                        # Re-read motion state after clip (abort_check may have fired)
+                        motion_camera_id = detector.check_all_cameras()
 
             # Render still frames when GUI mode is available.
+            # Pull the latest pre-fetched frame from the background grabber cache.
             if display is not None and (now - last_display_update) >= display_interval:
-                frame_path = _grab_display_frame(current_rtsp_url, current_camera_id)
-                if frame_path is not None:
+                cached = _frame_cache.get(current_camera_id)
+                # Consider fresh if grabbed within 4× the display interval + 2 s
+                max_stale = display_interval * 4 + 2.0
+                frame_fresh = (
+                    cached is not None
+                    and (now - cached[1]) < max_stale
+                )
+                if frame_fresh:
+                    frame_path, _ = cached
                     frame_fail_counts[current_camera_id] = 0
                     last_successful_frame_at = now
-                    # Annotate with motion-age text when memory is available
                     ago = motion_memory.time_since_motion(current_camera_id)
                     if ago:
                         ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
@@ -825,7 +856,6 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                         frame_fail_counts.get(current_camera_id, 0) + 1
                     )
                     if last_frame_path is not None:
-                        # Re-annotate the cached frame (age text changes every second)
                         ago = motion_memory.time_since_motion(current_camera_id)
                         if ago:
                             ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
@@ -844,11 +874,12 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     except Exception as e:
         logger.exception(f"Motion detection error: {e}")
     finally:
+        _grabber_stop.set()          # signal all grabber threads to exit
         detector.stop_monitoring()
         if display is not None:
             display.close()
         else:
             _terminate_procs(procs)
             _close_files(files)
-    
+
     return 0
