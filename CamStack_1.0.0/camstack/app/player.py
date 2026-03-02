@@ -619,8 +619,9 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     
     # Extract configuration
     snapshot_interval = motion_config.get("snapshot_interval", 1.0)
-    sensitivity = motion_config.get("sensitivity", 12.0)
-    frame_threshold = motion_config.get("frame_threshold", 3)
+    sensitivity = motion_config.get("sensitivity", 2.0)
+    frame_threshold = motion_config.get("frame_threshold", 2)
+    diff_threshold = motion_config.get("diff_threshold", 8)
     rotation_interval = motion_config.get("rotation_interval", 20)
     cameras = motion_config.get("cameras", {})
     
@@ -633,6 +634,7 @@ def launch_with_motion_detection(motion_config: dict) -> int:
         snapshot_interval=snapshot_interval,
         sensitivity=sensitivity,
         frame_threshold=frame_threshold,
+        diff_threshold=diff_threshold,
     )
     
     # Add all enabled cameras
