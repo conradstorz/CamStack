@@ -162,17 +162,29 @@ def _annotate_frame(
         w, h = img.size
 
         font_size = max(18, h // 22)
-        try:
-            font = ImageFont.truetype(
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size
-            )
-        except Exception:
-            font = ImageFont.load_default()
+        _font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        def _make_font(size: int):
+            try:
+                return ImageFont.truetype(_font_path, size)
+            except Exception:
+                return ImageFont.load_default()
+
+        font = _make_font(font_size)
+        pad = 10
+        h_margin = max(pad * 4, w // 16)   # horizontal safe zone on each side
+        max_tw = w - h_margin * 2
+
+        # Shrink font until the label fits within the safe horizontal width
+        while font_size > 10:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            if (bbox[2] - bbox[0]) <= max_tw:
+                break
+            font_size -= 2
+            font = _make_font(font_size)
 
         bbox = draw.textbbox((0, 0), text, font=font)
         tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
-        pad = 10
         # Keep banner well clear of the bottom edge so it isn't clipped when
         # tkinter letterboxes or the display overscan trims the frame.
         bottom_margin = max(pad * 4, h // 14)  # ≥6% of frame height
