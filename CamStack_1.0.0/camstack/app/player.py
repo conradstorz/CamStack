@@ -173,12 +173,15 @@ def _annotate_frame(
         tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
         pad = 10
+        # Keep banner well clear of the bottom edge so it isn't clipped when
+        # tkinter letterboxes or the display overscan trims the frame.
+        bottom_margin = max(pad * 4, h // 14)  # ≥6% of frame height
 
         # Background pill centred at the bottom of the frame
         rx0 = (w - tw) // 2 - pad
-        ry0 = h - th - pad * 3
+        ry1 = h - bottom_margin
+        ry0 = ry1 - th - pad * 2
         rx1 = rx0 + tw + pad * 2
-        ry1 = h - pad
         draw.rounded_rectangle([rx0, ry0, rx1, ry1], radius=8, fill=(0, 0, 0, 172))
         draw.text(
             ((w - tw) // 2, ry0 + pad // 2),
