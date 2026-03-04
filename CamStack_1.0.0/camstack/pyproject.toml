@@ -15,6 +15,7 @@ dependencies = [
   "starlette",
   "numpy",
   "pillow",
+  "opencv-python-headless",
 ]
 
 [tool.uv]

@@ -4,6 +4,7 @@ import subprocess, json, time, signal, threading, os
 from dataclasses import dataclass
 from typing import Optional
 from loguru import logger
+import cv2
 from PIL import Image, ImageTk
 from .overlay_gen import write_overlay
 from .fallback import (
@@ -623,18 +624,32 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     frame_threshold = motion_config.get("frame_threshold", 2)
     diff_threshold = motion_config.get("diff_threshold", 8)
     rotation_interval = motion_config.get("rotation_interval", 20)
+    idle_fps = motion_config.get("idle_fps", 5.0)
+    active_fps = motion_config.get("active_fps", 15.0)
+    ring_seconds = motion_config.get("ring_seconds", 180.0)
+    k_enter = motion_config.get("k_enter", 5)
+    k_disarm = motion_config.get("k_disarm", 2)
+    window_size = motion_config.get("window_size", 8)
+    cooldown_seconds = motion_config.get("cooldown_seconds", 15.0)
     cameras = motion_config.get("cameras", {})
     
     if not cameras:
         logger.error("No cameras configured for motion detection")
         return launch_rtsp_with_watchdog()  # Fall back to single camera mode
     
-    # Initialize motion detector
+    # Initialize motion detector (thin façade over CameraStream objects)
     detector = MotionDetector(
         snapshot_interval=snapshot_interval,
         sensitivity=sensitivity,
         frame_threshold=frame_threshold,
         diff_threshold=diff_threshold,
+        idle_fps=idle_fps,
+        active_fps=active_fps,
+        ring_seconds=ring_seconds,
+        k_enter=k_enter,
+        k_disarm=k_disarm,
+        window_size=window_size,
+        cooldown_seconds=cooldown_seconds,
     )
     
     # Add all enabled cameras
@@ -655,8 +670,7 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     motion_memory = MotionMemory(
         clip_duration=motion_config.get("clip_duration", DEFAULT_CLIP_DURATION)
     )
-    prev_motion_camera_id: Optional[str] = None
-    # Lookup dict for fast url resolution during motion rising-edge handler
+    # Lookup dict for fast url resolution during on_confirmed callback
     _camera_url_map: dict[str, str] = {cam_id: url for cam_id, url in enabled_cameras}
 
     # State tracking
@@ -680,20 +694,30 @@ def launch_with_motion_detection(motion_config: dict) -> int:
         display = None
     display_capable = display is not None
 
-    # Background frame cache: one grabber thread per camera pre-fetches frames
-    # so the main loop never blocks on ffmpeg RTSP calls.
-    # Cache entries: None initially, then (Path, grab_timestamp: float).
+    # Per-camera snapshot path cache for the still-frame renderer.
+    # Populated inline in the display loop from CameraStream's latest frame (no
+    # separate ffmpeg grabber threads — CameraStream handles persistent RTSP).
+    # Entries: None | (Path, grab_timestamp: float)
     _frame_cache: dict[str, tuple[Path, float] | None] = {
         cam_id: None for cam_id, _ in enabled_cameras
     }
-    _grabber_stop = threading.Event()
 
-    # Start motion detection and, if the GUI is available, background grabbers.
+    # Wire the on_confirmed callback: fires once per motion event with the
+    # pre-event ring-buffer snapshot so recording captures context before trigger.
+    def _on_motion_confirmed(camera_id: str, pre_frames) -> None:  # type: ignore[type-arg]
+        cam_url = _camera_url_map.get(camera_id)
+        if cam_url:
+            cam_score = (
+                detector.get_camera_states()
+                .get(camera_id, {})
+                .get("motion_score", 0.0)
+            ) / 100.0
+            motion_memory.record_clip(camera_id, cam_url, cam_score, pre_frames=pre_frames)
+
+    detector.on_confirmed = _on_motion_confirmed
+
+    # Start all CameraStream threads (persistent RTSP + K-of-N state machines).
     detector.start_monitoring()
-    if display_capable:
-        _start_frame_grabbers(
-            enabled_cameras, display_interval, _grabber_stop, _frame_cache
-        )
 
     # Fallback path: if tkinter unavailable use mpv per-camera (legacy mode).
     if display is None:
@@ -730,21 +754,10 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                 time.sleep(2)
                 continue
             
-            # Check for motion
+            # Check for motion (returns camera_id if any stream is in RECORDING state)
             motion_camera_id = detector.check_all_cameras()
-
-            # Rising-edge: a camera that was not firing motion just started.
-            # Trigger clip recording immediately so it captures the live event.
-            if motion_camera_id and motion_camera_id != prev_motion_camera_id:
-                cam_url_for_rec = _camera_url_map.get(motion_camera_id)
-                if cam_url_for_rec:
-                    cam_score = (
-                        detector.get_camera_states()
-                        .get(motion_camera_id, {})
-                        .get("motion_score", 0.0)
-                    ) / 100.0
-                    motion_memory.record_clip(motion_camera_id, cam_url_for_rec, cam_score)
-            prev_motion_camera_id = motion_camera_id
+            # Note: clip recording is handled by detector.on_confirmed callback which
+            # fires once per event with the pre-event ring buffer for context.
 
             # If all monitored cameras have failed/been disabled, stop showing
             # stale camera imagery and switch to nature fallback behavior.
@@ -759,7 +772,7 @@ def launch_with_motion_detection(motion_config: dict) -> int:
 
             if all_cameras_offline or all_snapshots_failing or frame_timeout_exceeded:
                 logger.warning("All motion cameras appear offline; switching to fallback stream")
-                _grabber_stop.set()
+                detector.stop_monitoring()
                 if display is not None:
                     display.show_black()  # black frame so desktop never flashes
                     display.close()
@@ -849,10 +862,17 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                         motion_camera_id = detector.check_all_cameras()
 
             # Render still frames when GUI mode is available.
-            # Pull the latest pre-fetched frame from the background grabber cache.
+            # Get the latest frame directly from the CameraStream (no separate grabber threads).
             if display is not None and (now - last_display_update) >= display_interval:
+                bgr_frame = detector.get_display_frame(current_camera_id)
+                if bgr_frame is not None:
+                    snap_path = SNAP_DIR / f"live_{_safe_camera_id(current_camera_id)}.jpg"
+                    # BGR→RGB then save as JPEG for the PIL-based display renderer
+                    rgb = bgr_frame[:, :, ::-1]
+                    Image.fromarray(rgb).save(str(snap_path), "JPEG", quality=85)
+                    _frame_cache[current_camera_id] = (snap_path, now)
                 cached = _frame_cache.get(current_camera_id)
-                # Consider fresh if grabbed within 4× the display interval + 2 s
+                # Consider fresh if decoded within 4× the display interval + 2 s
                 max_stale = display_interval * 4 + 2.0
                 frame_fresh = (
                     cached is not None
@@ -891,8 +911,7 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     except Exception as e:
         logger.exception(f"Motion detection error: {e}")
     finally:
-        _grabber_stop.set()          # signal all grabber threads to exit
-        detector.stop_monitoring()
+        detector.stop_monitoring()    # stops all CameraStream threads
         if display is not None:
             display.close()
         else:

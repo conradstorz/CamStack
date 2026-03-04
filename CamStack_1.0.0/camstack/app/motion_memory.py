@@ -20,9 +20,11 @@ import json
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence, Union
 
+import numpy as np
 from loguru import logger
 
 # ---------------------------------------------------------------------------#
@@ -32,9 +34,11 @@ from loguru import logger
 CLIPS_DIR = Path("/opt/camstack/runtime/clips")
 MEMORY_FILE = Path("/opt/camstack/runtime/motion_memory.json")
 
-DEFAULT_CLIP_DURATION: int = 12     # seconds of video captured per motion event
+DEFAULT_CLIP_DURATION: int = 12     # seconds of post-event video captured
 MAX_CLIPS_PER_CAMERA: int = 3       # oldest clips pruned automatically
-RECORD_TIMEOUT: int = 25            # hard subprocess timeout (must exceed clip duration)
+RECORD_TIMEOUT: int = 45            # hard subprocess timeout (must exceed clip + pre-encode time)
+PRE_EVENT_SECONDS: float = 30.0     # how many seconds of pre-event buffer to include
+PRE_FRAMES_FPS: float = 5.0         # FPS used when writing pre-event frames to temp file
 
 
 # ---------------------------------------------------------------------------#
@@ -122,9 +126,14 @@ class MotionMemory:
         camera_id: str,
         rtsp_url: str,
         score: float = 0.0,
+        pre_frames: Optional[Union[deque, Sequence[np.ndarray]]] = None,
     ) -> None:
         """
         Trigger a background clip recording for *camera_id*.
+
+        If *pre_frames* is provided (a snapshot of the ring buffer taken at
+        the moment motion was confirmed), those frames are prepended to the
+        clip MP4 so the first ~30 s of context before the event is preserved.
 
         No-op if a recording is already in progress for the same camera.
         Non-blocking — returns immediately.
@@ -134,9 +143,17 @@ class MotionMemory:
                 return
             self._recording.add(camera_id)
 
+        # Copy the pre_frames snapshot so the ring buffer can keep advancing.
+        pre_copy: list[np.ndarray] = []
+        if pre_frames is not None:
+            frames_list = list(pre_frames)
+            # Keep at most PRE_EVENT_SECONDS worth at PRE_FRAMES_FPS
+            max_pre = int(PRE_EVENT_SECONDS * PRE_FRAMES_FPS)
+            pre_copy = frames_list[-max_pre:] if len(frames_list) > max_pre else frames_list
+
         threading.Thread(
             target=self._do_record,
-            args=(camera_id, rtsp_url, score),
+            args=(camera_id, rtsp_url, score, pre_copy),
             daemon=True,
             name=f"motmem-rec-{_safe_id(camera_id)}",
         ).start()
@@ -193,29 +210,110 @@ class MotionMemory:
     # Internal                                                             #
     # ------------------------------------------------------------------ #
 
-    def _do_record(self, camera_id: str, rtsp_url: str, score: float) -> None:
+    def _do_record(
+        self,
+        camera_id: str,
+        rtsp_url: str,
+        score: float,
+        pre_frames: list[np.ndarray],
+    ) -> None:
         """Background worker: capture clip via ffmpeg and update state."""
+        import tempfile, os
         safe = _safe_id(camera_id)
         ts = int(time.time())
         clip_path = CLIPS_DIR / f"{safe}_{ts}.mp4"
-
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-rtsp_transport", "tcp",
-            "-i", rtsp_url,
-            "-t", str(self.clip_duration),
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-            "-an",       # no audio (Pi CPU budget)
-            "-y", str(clip_path),
-        ]
+        pre_file: Optional[Path] = None
+        post_file: Optional[Path] = None
 
         try:
             logger.info(
                 f"[MotionMemory] Recording motion clip: camera={camera_id} "
-                f"file={clip_path.name} score={score:.3f}"
+                f"file={clip_path.name} score={score:.3f} "
+                f"pre_frames={len(pre_frames)}"
             )
-            subprocess.run(cmd, timeout=RECORD_TIMEOUT, check=True, capture_output=True)
 
+            # ----------------------------------------------------------------
+            # Step 1: encode pre-event frames to a temp MP4 (if any provided)
+            # ----------------------------------------------------------------
+            if pre_frames:
+                h, w = pre_frames[0].shape[:2]
+                fps = PRE_FRAMES_FPS
+                fd, pre_tmp = tempfile.mkstemp(suffix="_pre.mp4", dir=CLIPS_DIR)
+                os.close(fd)
+                pre_file = Path(pre_tmp)
+
+                cmd_pre = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-f", "rawvideo",
+                    "-vcodec", "rawvideo",
+                    "-s", f"{w}x{h}",
+                    "-r", str(fps),
+                    "-pix_fmt", "bgr24",
+                    "-i", "pipe:0",
+                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # ensure even dims for x264
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                    "-an",
+                    "-y", str(pre_file),
+                ]
+                proc = subprocess.Popen(cmd_pre, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                for frame in pre_frames:
+                    proc.stdin.write(frame.tobytes())
+                proc.stdin.close()
+                proc.wait(timeout=30)
+                if proc.returncode != 0:
+                    err = (proc.stderr.read() if proc.stderr else b"").decode(errors="replace")
+                    logger.warning(f"[MotionMemory] Pre-frames encode failed for {camera_id}: {err[:200]}")
+                    pre_file.unlink(missing_ok=True)
+                    pre_file = None
+                else:
+                    logger.debug(f"[MotionMemory] Pre-event encoded: {pre_file.name} ({len(pre_frames)} frames)")
+
+            # ----------------------------------------------------------------
+            # Step 2: record live RTSP post-event segment
+            # ----------------------------------------------------------------
+            fd2, post_tmp = tempfile.mkstemp(suffix="_post.mp4", dir=CLIPS_DIR)
+            os.close(fd2)
+            post_file = Path(post_tmp)
+
+            cmd_post = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-rtsp_transport", "tcp",
+                "-i", rtsp_url,
+                "-t", str(self.clip_duration),
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                "-an",
+                "-y", str(post_file),
+            ]
+            subprocess.run(cmd_post, timeout=self.clip_duration + 15, check=True, capture_output=True)
+
+            # ----------------------------------------------------------------
+            # Step 3: concatenate (if we have a pre-event file) or just rename
+            # ----------------------------------------------------------------
+            if pre_file is not None and pre_file.exists() and pre_file.stat().st_size > 0:
+                # Write concat list file to temp location
+                fd3, list_tmp = tempfile.mkstemp(suffix="_list.txt", dir=CLIPS_DIR)
+                os.close(fd3)
+                list_file = Path(list_tmp)
+                list_file.write_text(
+                    f"file '{pre_file}'\nfile '{post_file}'\n"
+                )
+                cmd_cat = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-f", "concat", "-safe", "0",
+                    "-i", str(list_file),
+                    "-c", "copy",
+                    "-y", str(clip_path),
+                ]
+                subprocess.run(cmd_cat, timeout=30, check=True, capture_output=True)
+                list_file.unlink(missing_ok=True)
+            else:
+                # No valid pre-event file — just use the post-event segment
+                post_file.rename(clip_path)
+                post_file = None  # already moved
+
+            # ----------------------------------------------------------------
+            # Step 4: persist entry
+            # ----------------------------------------------------------------
             if clip_path.exists() and clip_path.stat().st_size > 0:
                 with self._lock:
                     self._data[camera_id] = {
@@ -252,6 +350,10 @@ class MotionMemory:
             clip_path.unlink(missing_ok=True)
 
         finally:
+            # Clean up temp files regardless of outcome
+            for tmp in (pre_file, post_file):
+                if tmp is not None:
+                    tmp.unlink(missing_ok=True)
             with self._lock:
                 self._recording.discard(camera_id)
 
