@@ -282,6 +282,7 @@ class MotionMemory:
                 "-t", str(self.clip_duration),
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                 "-an",
+                "-movflags", "+faststart",
                 "-y", str(post_file),
             ]
             subprocess.run(cmd_post, timeout=self.clip_duration + 15, check=True, capture_output=True)
@@ -302,6 +303,7 @@ class MotionMemory:
                     "-f", "concat", "-safe", "0",
                     "-i", str(list_file),
                     "-c", "copy",
+                    "-movflags", "+faststart",
                     "-y", str(clip_path),
                 ]
                 subprocess.run(cmd_cat, timeout=30, check=True, capture_output=True)
