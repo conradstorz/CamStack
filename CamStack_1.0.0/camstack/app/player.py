@@ -214,12 +214,14 @@ def _play_clip_as_stills(
     display: "StillFrameDisplay",
     annotation: str = "",
     fps: int = 8,
+    speed: float = 1.0,
     abort_check=None,
 ) -> None:
     """
     Decode a recorded mp4 clip to JPEG frames and render via StillFrameDisplay.
     No mpv spawned. No window teardown. Desktop never exposed.
     abort_check is an optional callable() -> bool; return True to stop early.
+    speed > 1.0 accelerates playback (e.g. 2.0 = double speed).
     """
     import tempfile, shutil
     tmp = Path(tempfile.mkdtemp(prefix="camclip_"))
@@ -241,7 +243,8 @@ def _play_clip_as_stills(
         if not frames:
             logger.warning(f"[ClipStills] No frames decoded from {clip_path.name}")
             return
-        frame_interval = 1.0 / fps
+        effective_speed = max(0.25, float(speed))
+        frame_interval = 1.0 / (fps * effective_speed)
         for frame in frames:
             if abort_check and abort_check():
                 logger.debug("[ClipStills] Aborted early — live motion detected")
@@ -631,6 +634,7 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     k_disarm = motion_config.get("k_disarm", 2)
     window_size = motion_config.get("window_size", 8)
     cooldown_seconds = motion_config.get("cooldown_seconds", 15.0)
+    clip_playback_speed = motion_config.get("clip_playback_speed", 2.0)
     cameras = motion_config.get("cameras", {})
     
     if not cameras:
@@ -856,6 +860,7 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                             display,
                             annotation=annotation,
                             fps=8,
+                            speed=clip_playback_speed,
                             abort_check=lambda: bool(detector.check_all_cameras()),
                         )
                         # Re-read motion state after clip (abort_check may have fired)

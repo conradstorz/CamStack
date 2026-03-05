@@ -49,6 +49,7 @@ def _default_motion_cfg() -> dict:
         "sensitivity": 12.0,
         "frame_threshold": 3,
         "rotation_interval": 20,
+        "clip_playback_speed": 2.0,
         "cameras": {},
     }
 
@@ -354,6 +355,7 @@ class MotionConfigUpdate(BaseModel):
     sensitivity: float | None = None
     frame_threshold: int | None = None
     rotation_interval: int | None = None
+    clip_playback_speed: float | None = None
 
 
 @app.post("/api/motion/config")
@@ -380,6 +382,8 @@ def update_motion_config(req: MotionConfigUpdate):
             motion_cfg["frame_threshold"] = max(1, min(10, req.frame_threshold))
         if req.rotation_interval is not None:
             motion_cfg["rotation_interval"] = max(5, min(300, req.rotation_interval))
+        if req.clip_playback_speed is not None:
+            motion_cfg["clip_playback_speed"] = max(0.25, min(16.0, req.clip_playback_speed))
         
         # Save back
         cfg["motion_detection"] = motion_cfg
