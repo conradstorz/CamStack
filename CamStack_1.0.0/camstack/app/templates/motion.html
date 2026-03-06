@@ -36,6 +36,11 @@ async function loadMotionSettings() {
           <span><strong>Enable Motion Detection</strong></span>
         </label>
         <p class="muted" style="margin-left:28px;margin-top:-8px;">When enabled, player switches between cameras based on motion</p>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+          <input type="checkbox" id="ambientNatureFeed" ${config.ambient_nature_feed !== false ? 'checked' : ''} onchange="updateMotionSettings()">
+          <span><strong>Ambient Nature Feed</strong></span>
+        </label>
+        <p class="muted" style="margin-left:28px;margin-top:-8px;">Show nature stream fullscreen with camera thumbnails in the corner when no motion is active</p>
       </div>
       
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;">
@@ -85,6 +90,7 @@ async function loadMotionSettings() {
 
 async function updateMotionSettings() {
   const enabled = document.getElementById('motionEnabled').checked;
+  const ambientNatureFeed = document.getElementById('ambientNatureFeed').checked;
   const snapshotInterval = parseFloat(document.getElementById('snapshotInterval').value);
   const sensitivity = parseFloat(document.getElementById('sensitivity').value);
   const frameThreshold = parseInt(document.getElementById('frameThreshold').value);
@@ -101,6 +107,7 @@ async function updateMotionSettings() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         enabled,
+        ambient_nature_feed: ambientNatureFeed,
         snapshot_interval: snapshotInterval,
         sensitivity,
         frame_threshold: frameThreshold,

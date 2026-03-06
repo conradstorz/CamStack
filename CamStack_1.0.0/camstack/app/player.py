@@ -4,6 +4,8 @@ import subprocess, json, time, signal, threading, os
 from dataclasses import dataclass
 from typing import Optional
 from loguru import logger
+import math
+import numpy as np
 import cv2
 from PIL import Image, ImageTk
 from .overlay_gen import write_overlay
@@ -139,6 +141,27 @@ class StillFrameDisplay:
             self.pump()
         except Exception as e:
             logger.debug(f"show_black failed: {e}")
+
+    def show_np_frame(self, frame: np.ndarray) -> bool:
+        """Render a BGR numpy array (from cv2) directly to the display window."""
+        if not self._alive:
+            return False
+        try:
+            self._enforce_fullscreen()
+            self._refresh_display_size()
+            rgb = frame[:, :, ::-1]
+            pil_img = Image.fromarray(rgb.astype("uint8"))
+            resized = pil_img.resize(
+                (max(1, self._width), max(1, self._height)),
+                Image.Resampling.BILINEAR,
+            )
+            self._photo = ImageTk.PhotoImage(resized)
+            self._label.configure(image=self._photo)
+            self.pump()
+            return True
+        except Exception as e:
+            logger.debug(f"show_np_frame failed: {e}")
+            return False
 
 
 def _safe_camera_id(camera_id: str) -> str:
@@ -284,6 +307,118 @@ def _show_default_still(display: StillFrameDisplay) -> bool:
     except Exception as e:
         logger.debug(f"Default still render failed: {e}")
     return False
+
+
+def _resolve_ytdlp_url(youtube_url: str) -> Optional[str]:
+    """Resolve a YouTube URL to a direct streamable URL via yt-dlp."""
+    try:
+        result = subprocess.run(
+            [
+                "yt-dlp",
+                "--format", "best[height<=480]/best",
+                "--extractor-args", "youtube:player_client=android",
+                "--no-playlist",
+                "-g", youtube_url,
+            ],
+            capture_output=True, text=True, timeout=45,
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip().split("\n")[0]
+            return url or None
+    except Exception as e:
+        logger.warning(f"[NatureGrabber] yt-dlp resolution failed: {e}")
+    return None
+
+
+class NatureGrabber:
+    """
+    Background thread that reads frames from a nature live stream.
+
+    Resolves a YouTube URL to a direct stream via yt-dlp, then reads
+    frames using cv2.VideoCapture.  ``latest_frame`` always holds the
+    most recent BGR numpy array, or ``None`` while buffering.
+    """
+
+    _REFRESH_INTERVAL: float = 1800.0   # re-resolve stream URL every 30 min
+    _IDLE_FPS: float = 5.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._frame: Optional[np.ndarray] = None
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="nature-grabber"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    @property
+    def latest_frame(self) -> Optional[np.ndarray]:
+        with self._lock:
+            return self._frame.copy() if self._frame is not None else None
+
+    def _run(self) -> None:
+        cap = None
+        last_resolve: float = 0.0
+        direct_url: Optional[str] = None
+        frame_interval = 1.0 / self._IDLE_FPS
+
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+
+            # Resolve / refresh the direct stream URL when needed.
+            if direct_url is None or (now - last_resolve) >= self._REFRESH_INTERVAL:
+                try:
+                    yt_url = get_featured_fallback_url(use_reddit=False)
+                    resolved = _resolve_ytdlp_url(yt_url)
+                    if resolved:
+                        if cap is not None:
+                            cap.release()
+                            cap = None
+                        direct_url = resolved
+                        last_resolve = now
+                        cap = cv2.VideoCapture(direct_url)
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+                        logger.info(f"[NatureGrabber] Stream opened: {direct_url[:80]}\u2026")
+                    else:
+                        logger.warning("[NatureGrabber] URL resolution returned nothing; retrying in 60 s")
+                        self._stop_event.wait(60)
+                        continue
+                except Exception as exc:
+                    logger.warning(f"[NatureGrabber] URL resolution error: {exc}")
+                    self._stop_event.wait(30)
+                    continue
+
+            if cap is None or not cap.isOpened():
+                direct_url = None
+                self._stop_event.wait(10)
+                continue
+
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning("[NatureGrabber] Frame read failed \u2014 reconnecting")
+                cap.release()
+                cap = None
+                direct_url = None
+                continue
+
+            with self._lock:
+                self._frame = frame
+
+            self._stop_event.wait(frame_interval)
+
+        if cap is not None:
+            cap.release()
+        logger.debug("[NatureGrabber] Thread exited")
+
 
 def run_player_once(url: str) -> int:
     write_overlay(False)
@@ -611,6 +746,73 @@ def _start_frame_grabbers(
     return threads
 
 
+def _compose_ambient_frame(
+    nature_frame: Optional[np.ndarray],
+    camera_frames: list[tuple[str, np.ndarray]],
+    screen_w: int,
+    screen_h: int,
+) -> np.ndarray:
+    """
+    Compose a fullscreen ambient display frame.
+
+    Nature footage fills the entire screen as the background.  Camera
+    tiles are overlaid in the bottom-right quadrant (Q4), subdivided
+    into a grid that fits all active cameras simultaneously.
+    """
+    # Base: nature scaled to screen, or solid black while buffering
+    if nature_frame is not None:
+        base = cv2.resize(nature_frame, (screen_w, screen_h))
+    else:
+        base = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+
+    if not camera_frames:
+        return base
+
+    # Bottom-right quadrant
+    qx = screen_w // 2
+    qy = screen_h // 2
+    qw = screen_w - qx
+    qh = screen_h - qy
+
+    n = len(camera_frames)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    tile_w = max(1, qw // cols)
+    tile_h = max(1, qh // rows)
+
+    for idx, (cam_id, cam_frame) in enumerate(camera_frames):
+        col = idx % cols
+        row = idx // cols
+        x0 = qx + col * tile_w
+        y0 = qy + row * tile_h
+        x1 = min(screen_w, x0 + tile_w)
+        y1 = min(screen_h, y0 + tile_h)
+        tw, th = x1 - x0, y1 - y0
+        if tw <= 0 or th <= 0:
+            continue
+
+        tile = cv2.resize(cam_frame, (tw, th))
+
+        # Thin separator border
+        cv2.rectangle(tile, (0, 0), (tw - 1, th - 1), (50, 50, 50), 1)
+
+        # Camera ID label (bottom-left corner of tile)
+        label = cam_id if len(cam_id) <= 18 else cam_id[-18:]
+        font_scale = max(0.3, th / 240.0)
+        cv2.putText(
+            tile, label, (4, th - 6),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+            (220, 220, 220), 1, cv2.LINE_AA,
+        )
+
+        base[y0:y1, x0:x1] = tile
+
+    # Subtle border around the entire camera quadrant
+    cv2.rectangle(base, (qx, qy), (screen_w - 1, screen_h - 1), (70, 70, 70), 2)
+
+    return base
+
+
 def launch_with_motion_detection(motion_config: dict) -> int:
     """
     Launch multi-camera player with motion-based switching.
@@ -698,6 +900,14 @@ def launch_with_motion_detection(motion_config: dict) -> int:
         display = None
     display_capable = display is not None
 
+    # Ambient nature-feed: nature fills the screen when no camera has active motion.
+    ambient_nature_feed: bool = motion_config.get("ambient_nature_feed", True)
+    nature_grabber: Optional[NatureGrabber] = None
+    if ambient_nature_feed and display_capable:
+        nature_grabber = NatureGrabber()
+        nature_grabber.start()
+        logger.info("[AmbientMode] Nature grabber started \u2014 nature feed active in idle mode")
+
     # Per-camera snapshot path cache for the still-frame renderer.
     # Populated inline in the display loop from CameraStream's latest frame (no
     # separate ffmpeg grabber threads — CameraStream handles persistent RTSP).
@@ -769,10 +979,17 @@ def launch_with_motion_detection(motion_config: dict) -> int:
             all_cameras_offline = bool(camera_states) and all(
                 (not st.get("enabled", True)) for st in camera_states.values()
             )
-            all_snapshots_failing = bool(frame_fail_counts) and all(
-                count >= all_offline_fail_threshold for count in frame_fail_counts.values()
+            all_snapshots_failing = (
+                bool(frame_fail_counts)
+                and all(count >= all_offline_fail_threshold for count in frame_fail_counts.values())
+                and (nature_grabber is None or nature_grabber.latest_frame is None)
             )
-            frame_timeout_exceeded = (now - last_successful_frame_at) >= offline_frame_timeout
+            # Don't time-out when nature_grabber is active — it provides ambient content
+            # even if cameras are temporarily unreachable.
+            frame_timeout_exceeded = (
+                (now - last_successful_frame_at) >= offline_frame_timeout
+                and nature_grabber is None
+            )
 
             if all_cameras_offline or all_snapshots_failing or frame_timeout_exceeded:
                 logger.warning("All motion cameras appear offline; switching to fallback stream")
@@ -826,8 +1043,8 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                     motion_mode = False
                     last_rotation = now
             
-            # Rotation logic (only when no motion)
-            if not motion_mode and (now - last_rotation) >= rotation_interval:
+            # Rotation logic (only when no motion AND ambient mode is off)
+            if not motion_mode and nature_grabber is None and (now - last_rotation) >= rotation_interval:
                 # Time to rotate to next camera
                 if display is None:
                     _terminate_procs(procs)
@@ -867,46 +1084,62 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                         motion_camera_id = detector.check_all_cameras()
 
             # Render still frames when GUI mode is available.
-            # Get the latest frame directly from the CameraStream (no separate grabber threads).
             if display is not None and (now - last_display_update) >= display_interval:
-                bgr_frame = detector.get_display_frame(current_camera_id)
-                if bgr_frame is not None:
-                    snap_path = SNAP_DIR / f"live_{_safe_camera_id(current_camera_id)}.jpg"
-                    # BGR→RGB then save as JPEG for the PIL-based display renderer
-                    rgb = bgr_frame[:, :, ::-1]
-                    Image.fromarray(rgb).save(str(snap_path), "JPEG", quality=85)
-                    _frame_cache[current_camera_id] = (snap_path, now)
-                cached = _frame_cache.get(current_camera_id)
-                # Consider fresh if decoded within 4× the display interval + 2 s
-                max_stale = display_interval * 4 + 2.0
-                frame_fresh = (
-                    cached is not None
-                    and (now - cached[1]) < max_stale
-                )
-                if frame_fresh:
-                    frame_path, _ = cached
-                    frame_fail_counts[current_camera_id] = 0
-                    last_successful_frame_at = now
-                    ago = motion_memory.time_since_motion(current_camera_id)
-                    if ago:
-                        ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
-                        frame_path = _annotate_frame(frame_path, f"Last motion: {ago}", ann_path)
-                    if display.show_image(frame_path):
-                        last_frame_path = frame_path
-                else:
-                    frame_fail_counts[current_camera_id] = (
-                        frame_fail_counts.get(current_camera_id, 0) + 1
+                if nature_grabber is not None and not motion_mode:
+                    # ── Ambient mode: nature background + all camera tiles in Q4 ──
+                    n_frame = nature_grabber.latest_frame
+                    cam_tiles: list[tuple[str, np.ndarray]] = []
+                    for cam_id, _ in enabled_cameras:
+                        f = detector.get_display_frame(cam_id)
+                        if f is not None:
+                            cam_tiles.append((cam_id, f))
+                            frame_fail_counts[cam_id] = 0
+                        else:
+                            frame_fail_counts[cam_id] = frame_fail_counts.get(cam_id, 0) + 1
+                    if n_frame is not None or cam_tiles:
+                        last_successful_frame_at = now
+                    composite = _compose_ambient_frame(
+                        n_frame, cam_tiles, display._width, display._height
                     )
-                    if last_frame_path is not None:
+                    display.show_np_frame(composite)
+                else:
+                    # ── Single-camera mode (motion detected or ambient disabled) ──
+                    bgr_frame = detector.get_display_frame(current_camera_id)
+                    if bgr_frame is not None:
+                        snap_path = SNAP_DIR / f"live_{_safe_camera_id(current_camera_id)}.jpg"
+                        rgb = bgr_frame[:, :, ::-1]
+                        Image.fromarray(rgb).save(str(snap_path), "JPEG", quality=85)
+                        _frame_cache[current_camera_id] = (snap_path, now)
+                    cached = _frame_cache.get(current_camera_id)
+                    max_stale = display_interval * 4 + 2.0
+                    frame_fresh = (
+                        cached is not None
+                        and (now - cached[1]) < max_stale
+                    )
+                    if frame_fresh:
+                        frame_path, _ = cached
+                        frame_fail_counts[current_camera_id] = 0
+                        last_successful_frame_at = now
                         ago = motion_memory.time_since_motion(current_camera_id)
                         if ago:
                             ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
-                            show_path = _annotate_frame(
-                                last_frame_path, f"Last motion: {ago}", ann_path
-                            )
-                        else:
-                            show_path = last_frame_path
-                        display.show_image(show_path)
+                            frame_path = _annotate_frame(frame_path, f"Last motion: {ago}", ann_path)
+                        if display.show_image(frame_path):
+                            last_frame_path = frame_path
+                    else:
+                        frame_fail_counts[current_camera_id] = (
+                            frame_fail_counts.get(current_camera_id, 0) + 1
+                        )
+                        if last_frame_path is not None:
+                            ago = motion_memory.time_since_motion(current_camera_id)
+                            if ago:
+                                ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
+                                show_path = _annotate_frame(
+                                    last_frame_path, f"Last motion: {ago}", ann_path
+                                )
+                            else:
+                                show_path = last_frame_path
+                            display.show_image(show_path)
                 last_display_update = now
             
             time.sleep(0.05)
@@ -917,6 +1150,8 @@ def launch_with_motion_detection(motion_config: dict) -> int:
         logger.exception(f"Motion detection error: {e}")
     finally:
         detector.stop_monitoring()    # stops all CameraStream threads
+        if nature_grabber is not None:
+            nature_grabber.stop()
         if display is not None:
             display.close()
         else:
