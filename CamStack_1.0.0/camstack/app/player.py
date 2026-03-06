@@ -340,7 +340,7 @@ class NatureGrabber:
     """
 
     _REFRESH_INTERVAL: float = 1800.0   # re-resolve stream URL every 30 min
-    _IDLE_FPS: float = 5.0
+    _IDLE_FPS: float = 25.0
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -885,6 +885,10 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     motion_mode = False
     display_interval = max(0.15, min(1.0, snapshot_interval))
     last_display_update = 0.0
+    # Ambient nature feed renders independently at ~20fps, decoupled from the
+    # camera snapshot_interval which only needs to be as fast as ffmpeg grabs.
+    _ambient_interval = 1.0 / 20.0
+    last_ambient_update = 0.0
     last_frame_path: Optional[Path] = None
     last_successful_frame_at = time.monotonic()
     frame_fail_counts: dict[str, int] = {cam_id: 0 for cam_id, _ in enabled_cameras}
@@ -1088,8 +1092,10 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                         motion_camera_id = detector.check_all_cameras()
 
             # Render still frames when GUI mode is available.
-            if display is not None and (now - last_display_update) >= display_interval:
-                if nature_grabber is not None and not motion_mode:
+            # Ambient nature feed uses its own fast interval; single-camera mode
+            # uses the slower display_interval tied to the snapshot rate.
+            if display is not None and nature_grabber is not None and not motion_mode:
+                if (now - last_ambient_update) >= _ambient_interval:
                     # ── Ambient mode: nature background + all camera tiles in Q4 ──
                     n_frame = nature_grabber.latest_frame
                     cam_tiles: list[tuple[str, np.ndarray]] = []
@@ -1106,47 +1112,48 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                         n_frame, cam_tiles, display._width, display._height
                     )
                     display.show_np_frame(composite)
+                    last_ambient_update = now
+            elif display is not None and (now - last_display_update) >= display_interval:
+                # ── Single-camera mode (motion detected or ambient disabled) ──
+                bgr_frame = detector.get_display_frame(current_camera_id)
+                if bgr_frame is not None:
+                    snap_path = SNAP_DIR / f"live_{_safe_camera_id(current_camera_id)}.jpg"
+                    rgb = bgr_frame[:, :, ::-1]
+                    Image.fromarray(rgb).save(str(snap_path), "JPEG", quality=85)
+                    _frame_cache[current_camera_id] = (snap_path, now)
+                cached = _frame_cache.get(current_camera_id)
+                max_stale = display_interval * 4 + 2.0
+                frame_fresh = (
+                    cached is not None
+                    and (now - cached[1]) < max_stale
+                )
+                if frame_fresh:
+                    frame_path, _ = cached
+                    frame_fail_counts[current_camera_id] = 0
+                    last_successful_frame_at = now
+                    ago = motion_memory.time_since_motion(current_camera_id)
+                    if ago:
+                        ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
+                        frame_path = _annotate_frame(frame_path, f"Last motion: {ago}", ann_path)
+                    if display.show_image(frame_path):
+                        last_frame_path = frame_path
                 else:
-                    # ── Single-camera mode (motion detected or ambient disabled) ──
-                    bgr_frame = detector.get_display_frame(current_camera_id)
-                    if bgr_frame is not None:
-                        snap_path = SNAP_DIR / f"live_{_safe_camera_id(current_camera_id)}.jpg"
-                        rgb = bgr_frame[:, :, ::-1]
-                        Image.fromarray(rgb).save(str(snap_path), "JPEG", quality=85)
-                        _frame_cache[current_camera_id] = (snap_path, now)
-                    cached = _frame_cache.get(current_camera_id)
-                    max_stale = display_interval * 4 + 2.0
-                    frame_fresh = (
-                        cached is not None
-                        and (now - cached[1]) < max_stale
+                    frame_fail_counts[current_camera_id] = (
+                        frame_fail_counts.get(current_camera_id, 0) + 1
                     )
-                    if frame_fresh:
-                        frame_path, _ = cached
-                        frame_fail_counts[current_camera_id] = 0
-                        last_successful_frame_at = now
+                    if last_frame_path is not None:
                         ago = motion_memory.time_since_motion(current_camera_id)
                         if ago:
                             ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
-                            frame_path = _annotate_frame(frame_path, f"Last motion: {ago}", ann_path)
-                        if display.show_image(frame_path):
-                            last_frame_path = frame_path
-                    else:
-                        frame_fail_counts[current_camera_id] = (
-                            frame_fail_counts.get(current_camera_id, 0) + 1
-                        )
-                        if last_frame_path is not None:
-                            ago = motion_memory.time_since_motion(current_camera_id)
-                            if ago:
-                                ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
-                                show_path = _annotate_frame(
-                                    last_frame_path, f"Last motion: {ago}", ann_path
-                                )
-                            else:
-                                show_path = last_frame_path
-                            display.show_image(show_path)
+                            show_path = _annotate_frame(
+                                last_frame_path, f"Last motion: {ago}", ann_path
+                            )
+                        else:
+                            show_path = last_frame_path
+                        display.show_image(show_path)
                 last_display_update = now
-            
-            time.sleep(0.05)
+
+            time.sleep(0.033)  # ~30Hz tick — fast enough to service 20fps ambient renders
             
     except KeyboardInterrupt:
         logger.info("Motion detection interrupted by user")
