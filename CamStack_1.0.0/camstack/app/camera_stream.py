@@ -201,6 +201,13 @@ class CameraStream:
         else:
             cap = cv2.VideoCapture(url)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Reduce ffmpeg open/read timeouts from the 30s default to 8s so that
+        # a dead camera reconnect cycle takes ~10s instead of ~35s.
+        try:
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8_000)
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8_000)
+        except Exception:
+            pass  # property may not exist on older OpenCV builds
         if not cap.isOpened():
             logger.warning(f"[{self.camera_id}] Failed to open RTSP capture: {url}")
             return None

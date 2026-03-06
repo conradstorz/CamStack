@@ -933,6 +933,12 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     # Start all CameraStream threads (persistent RTSP + K-of-N state machines).
     detector.start_monitoring()
 
+    # Safe defaults so the finally block never hits UnboundLocalError.
+    # Only reassigned when display is None (legacy mpv path).
+    procs: list = []
+    primary = None
+    files: list = []
+
     # Fallback path: if tkinter unavailable use mpv per-camera (legacy mode).
     if display is None:
         write_overlay(False)
@@ -1154,7 +1160,7 @@ def launch_with_motion_detection(motion_config: dict) -> int:
             nature_grabber.stop()
         if display is not None:
             display.close()
-        else:
+        elif procs:
             _terminate_procs(procs)
             _close_files(files)
 
