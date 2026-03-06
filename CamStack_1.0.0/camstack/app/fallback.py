@@ -34,17 +34,46 @@ REDDIT_SEARCH_QUERIES = [
     "nature cam live",
 ]
 
+# Words that must appear in a post title for it to be considered nature-related.
+# Deliberately excludes generic words like "live", "stream", "cam", "camera"
+# which appear in too many non-nature contexts.
+_NATURE_KEYWORDS: frozenset[str] = frozenset({
+    "nature", "wildlife", "wild", "animal", "bird", "birds", "wolf", "wolves",
+    "bear", "bears", "eagle", "deer", "fox", "owl", "nest", "feeder",
+    "webcam", "forest", "ocean", "river", "lake", "pond", "safari", "habitat",
+    "explore", "outdoor", "garden",
+})
+
+# If any of these appear in a post title the post is rejected outright,
+# regardless of any nature keywords also present.
+_REJECT_KEYWORDS: frozenset[str] = frozenset({
+    "music", "song", "opera", "concert", "album", "band", "singer", "vocals",
+    "lyrics", "playlist", "soundtrack",
+    "gaming", "game", "minecraft", "fortnite", "twitch", "esport",
+    "movie", "film", "trailer", "comedy", "funny", "meme",
+    "news", "politics", "sports", "football", "basketball", "soccer",
+})
+
+
+def _is_nature_related_post(post: RedditPost) -> bool:
+    """Return True only if the post title looks like a live nature/wildlife cam."""
+    words = set(re.findall(r"[a-z]+", post.title.lower()))
+    if words & _REJECT_KEYWORDS:
+        return False
+    return bool(words & _NATURE_KEYWORDS)
+
 RUNTIME = Path("/opt/camstack/runtime")
 CACHE_FILE = RUNTIME / "fallback.json"
 REDDIT_CACHE_FILE = RUNTIME / "reddit_cams.json"
 
-def get_featured_fallback_url(use_reddit: bool = True) -> str:
+def get_featured_fallback_url(use_reddit: bool = True, exclude: set[str] | None = None) -> str:
     """
-    Get a random featured fallback URL.
-    
+    Get a random featured fallback URL, optionally excluding known-bad URLs.
+
     Args:
         use_reddit: If True, includes Reddit-discovered URLs in the selection
-    
+        exclude: Set of URLs to skip; falls back to full pool if all are excluded
+
     Returns:
         A random URL from available sources
     """
@@ -52,10 +81,11 @@ def get_featured_fallback_url(use_reddit: bool = True) -> str:
     if use_reddit:
         reddit_urls = get_reddit_nature_cams()
         if reddit_urls:
-            # Prefer Reddit URLs (70% chance) if available
-            if random.random() < 0.7:
-                return random.choice(reddit_urls)
             urls.extend(reddit_urls)
+    if exclude:
+        filtered = [u for u in urls if u not in exclude]
+        if filtered:
+            urls = filtered
     return random.choice(urls)
 
 @dataclass(frozen=True)
@@ -200,6 +230,9 @@ def get_reddit_nature_cams(use_cache: bool = True, max_age: int = 7200) -> list[
     for query in REDDIT_SEARCH_QUERIES:
         all_posts.extend(_search_reddit(query, limit=20, time_filter="week"))
     
+    # Discard posts that don't look like nature/wildlife content
+    all_posts = [p for p in all_posts if _is_nature_related_post(p)]
+
     # Extract YouTube URLs and rank by popularity
     url_scores: dict[str, int] = {}
     for post in all_posts:

@@ -326,7 +326,7 @@ def _resolve_ytdlp_url(youtube_url: str) -> Optional[str]:
             url = result.stdout.strip().split("\n")[0]
             return url or None
     except Exception as e:
-        logger.warning(f"[NatureGrabber] yt-dlp resolution failed: {e}")
+        logger.warning(f"[yt-dlp] URL resolution failed: {e}")
     return None
 
 
@@ -431,7 +431,7 @@ def run_player_once(url: str) -> int:
 
 def _build_mpv_cmd(url: str, use_ytdl: bool = True) -> list[str]:
     cmd = [
-        "mpv", "--hwdec=no", "--fs", "--force-window=yes", "--osc=no",
+        "mpv", "--hwdec=auto", "--fs", "--force-window=yes", "--osc=no",
         "--no-input-default-bindings", f"-sub-file={OVL}", "--sid=1",
         "--no-border", "-msg-level=all=info,ffmpeg=info",
         "--log-file=/opt/camstack/runtime/mpv-debug.log",
@@ -451,9 +451,8 @@ def _build_mpv_cmd(url: str, use_ytdl: bool = True) -> list[str]:
                 "--http-header-fields=Referer: https://www.youtube.com/",
                 "--http-header-fields=Origin: https://www.youtube.com",
                 "--script-opts=ytdl_hook-ytdl_path=yt-dlp",
-                "--ytdl-format=best[height<=720]",
-                "--ytdl-raw-options=force-ipv4=yes",
-                "--ytdl-raw-options=extractor-args=youtube:player_client=android",
+                "--ytdl-format=best[height<=480]/best",
+                "--ytdl-raw-options=force-ipv4=yes,extractor-args=youtube:player_client=android",
             ]
         )
     cmd.append(url)
@@ -462,25 +461,20 @@ def _build_mpv_cmd(url: str, use_ytdl: bool = True) -> list[str]:
 def _is_youtube_url(url: str) -> bool:
     return "youtube.com" in url or "youtu.be" in url
 
-def _spawn_player(url: str) -> tuple[list[subprocess.Popen], subprocess.Popen]:
+def _spawn_player(url: str) -> tuple[list[subprocess.Popen], subprocess.Popen, list]:
     if _is_youtube_url(url):
-        log_path = BASE / "runtime" / "ytdlp.log"
-        log_file = open(log_path, "a", encoding="utf-8")
-        yt_cmd = [
-            "yt-dlp",
-            "--no-progress",
-            "--downloader-args", "ffmpeg:-loglevel error",
-            "--extractor-args", "youtube:player_client=android",
-            "--format", "best[height<=720]",
-            "-o", "-",
-            url,
-        ]
-        yt_proc = subprocess.Popen(yt_cmd, stdout=subprocess.PIPE, stderr=log_file)
-        mpv_cmd = _build_mpv_cmd("-", use_ytdl=False)
-        mpv_proc = subprocess.Popen(mpv_cmd, stdin=yt_proc.stdout, stderr=subprocess.DEVNULL)
-        if yt_proc.stdout:
-            yt_proc.stdout.close()
-        return [yt_proc, mpv_proc], mpv_proc, [log_file]
+        # Resolve to a direct streamable URL first so mpv doesn't time out
+        # probing an empty stdin pipe while yt-dlp's internal ffmpeg starts up.
+        direct_url = _resolve_ytdlp_url(url)
+        if direct_url:
+            logger.info(f"[Player] Resolved {url[:60]}... -> direct stream")
+            mpv_proc = subprocess.Popen(
+                _build_mpv_cmd(direct_url, use_ytdl=False),
+                stderr=subprocess.DEVNULL,
+            )
+            return [mpv_proc], mpv_proc, []
+        # Resolution failed — let mpv use its own ytdl-hook as a fallback.
+        logger.warning("[Player] Direct URL resolution failed; trying mpv ytdl-hook")
     mpv_proc = subprocess.Popen(_build_mpv_cmd(url), stderr=subprocess.DEVNULL)
     return [mpv_proc], mpv_proc, []
 
@@ -538,7 +532,7 @@ def _fallback_loop(recover_urls: list[str] | None = None) -> int:
     blocked: set[str] = set()
     current = load_cached_stream()
     if current is None:
-        current = LiveStreamInfo(url=get_featured_fallback_url(), title=None, viewers=0)
+        current = LiveStreamInfo(url=get_featured_fallback_url(exclude=blocked), title=None, viewers=0)
 
     logger.warning(
         f"Fallback stream selected: {current.url} (viewers={current.viewers})"
@@ -570,13 +564,17 @@ def _fallback_loop(recover_urls: list[str] | None = None) -> int:
             if primary.poll() is not None:
                 blocked.add(current.url)
                 logger.warning("Fallback stream failed; selecting a new candidate")
+                time.sleep(3)  # brief backoff to prevent rapid crash loops
                 try:
                     best = get_best_live_stream(exclude=blocked)
                 except Exception as e:
                     logger.warning(f"Ranking failed: {e}")
                     best = None
                 if best is None:
-                    current = LiveStreamInfo(url=get_featured_fallback_url(), title=None, viewers=0)
+                    # Filter blocked URLs from the random pool to avoid re-selecting
+                    # a stream that just crashed.
+                    fallback_url = get_featured_fallback_url(exclude=blocked)
+                    current = LiveStreamInfo(url=fallback_url, title=None, viewers=0)
                 else:
                     current = best
                     save_cached_stream(best)
