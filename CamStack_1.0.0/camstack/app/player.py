@@ -15,6 +15,7 @@ from .fallback import (
     LiveStreamInfo,
     load_cached_stream,
     save_cached_stream,
+    EXPLORE_LIVE_URLS,
 )
 from .motion_detector import MotionDetector
 from .motion_memory import MotionMemory, DEFAULT_CLIP_DURATION
@@ -330,6 +331,62 @@ def _resolve_ytdlp_url(youtube_url: str) -> Optional[str]:
     return None
 
 
+# Words that disqualify a stream from being used as the ambient nature feed.
+_NATURE_REJECT: frozenset[str] = frozenset({
+    "music", "song", "opera", "concert", "album", "band", "singer",
+    "vocals", "lyrics", "playlist", "soundtrack", "pavarotti", "classical",
+    "gaming", "game", "minecraft", "fortnite", "twitch", "esport",
+    "movie", "film", "trailer", "comedy", "funny", "meme",
+    "news", "politics", "sports", "football", "basketball",
+})
+
+
+def _resolve_ytdlp_with_title(youtube_url: str, timeout: int = 50) -> Optional[tuple[str, str]]:
+    """
+    Resolve a YouTube URL to a direct stream URL **and** fetch its title in a
+    single yt-dlp invocation.  Returns ``(direct_url, title)`` or ``None``.
+    """
+    import re as _re
+    try:
+        result = subprocess.run(
+            [
+                "yt-dlp", "--no-warnings",
+                "--format", "best[height<=480]/best",
+                "--extractor-args", "youtube:player_client=android",
+                "--no-playlist", "-J", youtube_url,
+            ],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = json.loads(result.stdout)
+        title: str = data.get("title") or ""
+        # Reject non-nature / non-live content based on title words.
+        words = set(_re.findall(r"[a-z]+", title.lower()))
+        if words & _NATURE_REJECT:
+            logger.warning(f"[NatureGrabber] Title rejected: {title!r}")
+            return None
+        # Extract the direct playback URL from the JSON.
+        # Try multiple yt-dlp JSON fields in priority order.
+        url: Optional[str] = None
+        for rf in (data.get("requested_formats") or []):
+            url = rf.get("url")
+            if url:
+                break
+        if not url:
+            url = data.get("url")
+        if not url:
+            # Fall back: pick the best format by height from the formats list.
+            fmts = [f for f in (data.get("formats") or []) if f.get("url")]
+            candidates = [f for f in fmts if (f.get("height") or 9999) <= 480] or fmts
+            if candidates:
+                url = max(candidates, key=lambda f: f.get("height") or 0).get("url")
+        return (url, title) if url else None
+    except Exception as exc:
+        logger.warning(f"[NatureGrabber] resolve+title failed for {youtube_url}: {exc}")
+        return None
+
+
 class NatureGrabber:
     """
     Background thread that reads frames from a nature live stream.
@@ -340,7 +397,7 @@ class NatureGrabber:
     """
 
     _REFRESH_INTERVAL: float = 1800.0   # re-resolve stream URL every 30 min
-    _IDLE_FPS: float = 25.0
+    _IDLE_FPS: float = 12.0              # RPi4 can comfortably sustain 12fps software-decode
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -376,25 +433,35 @@ class NatureGrabber:
 
             # Resolve / refresh the direct stream URL when needed.
             if direct_url is None or (now - last_resolve) >= self._REFRESH_INTERVAL:
-                try:
-                    yt_url = get_featured_fallback_url(use_reddit=False)
-                    resolved = _resolve_ytdlp_url(yt_url)
-                    if resolved:
-                        if cap is not None:
-                            cap.release()
-                            cap = None
-                        direct_url = resolved
-                        last_resolve = now
-                        cap = cv2.VideoCapture(direct_url)
-                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-                        logger.info(f"[NatureGrabber] Stream opened: {direct_url[:80]}\u2026")
-                    else:
-                        logger.warning("[NatureGrabber] URL resolution returned nothing; retrying in 60 s")
-                        self._stop_event.wait(60)
+                import random as _random
+                resolved_url: Optional[str] = None
+                # Shuffle the candidate pool and try each until one passes
+                # content validation (title must not match _NATURE_REJECT).
+                pool = list(EXPLORE_LIVE_URLS)
+                _random.shuffle(pool)
+                for candidate in pool:
+                    result = _resolve_ytdlp_with_title(candidate)
+                    if result is None:
                         continue
-                except Exception as exc:
-                    logger.warning(f"[NatureGrabber] URL resolution error: {exc}")
-                    self._stop_event.wait(30)
+                    url_candidate, title_candidate = result
+                    resolved_url = url_candidate
+                    logger.info(f"[NatureGrabber] Selected stream: {title_candidate!r}")
+                    break
+
+                if resolved_url:
+                    if cap is not None:
+                        cap.release()
+                        cap = None
+                    direct_url = resolved_url
+                    last_resolve = now
+                    cap = cv2.VideoCapture(direct_url)
+                    # Larger buffer smooths over HLS segment boundaries
+                    # (~2-second segments on YouTube live streams).
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 4)
+                    logger.info(f"[NatureGrabber] Stream opened: {direct_url[:80]}\u2026")
+                else:
+                    logger.warning("[NatureGrabber] All candidates failed or rejected; retrying in 60 s")
+                    self._stop_event.wait(60)
                     continue
 
             if cap is None or not cap.isOpened():
