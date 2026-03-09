@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="card" style="margin-bottom:14px;">
+  <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">
+    <span id="status" class="muted">Loading cameras…</span>
+    <div class="row" style="gap:8px;">
+      <label class="muted" style="display:flex;align-items:center;gap:6px;font-size:14px;">
+        <input type="checkbox" id="labelToggle" checked onchange="toggleLabels()"> Show labels
+      </label>
+    </div>
+  </div>
+</div>
+
+<div id="grid" class="grid"></div>
+
+<style>
+  .live-card {
+    background: #0c0f14;
+    border: 1px solid #1f2430;
+    border-radius: 12px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .live-card .feed-wrap {
+    position: relative;
+    background: #000;
+    line-height: 0;
+  }
+  .live-card img.feed {
+    width: 100%;
+    height: auto;
+    display: block;
+    border-radius: 0;
+  }
+  .live-card .feed-overlay {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    background: linear-gradient(transparent, rgba(0,0,0,0.75));
+    padding: 6px 10px 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+  }
+  .live-card .cam-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: #e6e6e6;
+    text-shadow: 0 1px 4px rgba(0,0,0,0.9);
+  }
+  .live-badge {
+    background: #cf2222;
+    color: white;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    padding: 2px 7px;
+    border-radius: 6px;
+    text-shadow: none;
+  }
+  .live-card.offline .feed-wrap {
+    background: #0c0f14;
+    min-height: 180px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .offline-msg {
+    color: #555;
+    font-size: 13px;
+    text-align: center;
+    padding: 12px;
+  }
+  .hide-labels .cam-label,
+  .hide-labels .live-badge { display: none; }
+</style>
+
+<script>
+  async function loadCameras() {
+    try {
+      const res = await fetch('/api/motion/cameras');
+      const data = await res.json();
+      const cameras = data.cameras || {};
+      const camList = Object.entries(cameras)
+        .filter(([id, cfg]) => cfg.enabled !== false && cfg.rtsp_url)
+        .map(([id, cfg]) => ({ id, rtsp_url: cfg.rtsp_url }));
+
+      const status = document.getElementById('status');
+      const grid = document.getElementById('grid');
+
+      if (!camList.length) {
+        status.textContent = 'No cameras configured. Go to Camera Setup to add cameras.';
+        return;
+      }
+
+      status.textContent = `${camList.length} camera${camList.length > 1 ? 's' : ''}`;
+      grid.innerHTML = '';
+
+      camList.forEach(cam => {
+        const card = document.createElement('div');
+        card.className = 'live-card';
+        card.id = 'lcard-' + cam.id.replace(/\./g, '-');
+        card.style.width = '480px';
+
+        card.innerHTML = `
+          <div class="feed-wrap">
+            <img class="feed"
+                 src="/stream/${encodeURIComponent(cam.id)}"
+                 alt="${cam.id}"
+                 onerror="markOffline(this, '${cam.id.replace(/'/g,"\\'")}')">
+            <div class="feed-overlay">
+              <span class="cam-label">${cam.id}</span>
+              <span class="live-badge">LIVE</span>
+            </div>
+          </div>`;
+
+        grid.appendChild(card);
+      });
+    } catch (e) {
+      document.getElementById('status').textContent = 'Error loading cameras: ' + e.message;
+    }
+  }
+
+  function markOffline(img, camId) {
+    const cardId = 'lcard-' + camId.replace(/\./g, '-');
+    const card = document.getElementById(cardId);
+    if (!card || card.classList.contains('offline')) return;
+    card.classList.add('offline');
+    const wrap = card.querySelector('.feed-wrap');
+    wrap.innerHTML = `<div class="offline-msg">⚠ ${camId}<br><span style="color:#444;font-size:12px;">Stream unavailable — retrying…</span></div>`;
+
+    // Retry after 10s by reloading the page element
+    setTimeout(() => {
+      if (!card.classList.contains('offline')) return;
+      card.classList.remove('offline');
+      const newWrap = document.createElement('div');
+      newWrap.className = 'feed-wrap';
+      newWrap.innerHTML = `
+        <img class="feed"
+             src="/stream/${encodeURIComponent(camId)}?t=${Date.now()}"
+             alt="${camId}"
+             onerror="markOffline(this, '${camId.replace(/'/g,"\\'")}')">
+        <div class="feed-overlay">
+          <span class="cam-label">${camId}</span>
+          <span class="live-badge">LIVE</span>
+        </div>`;
+      wrap.replaceWith(newWrap);
+    }, 10000);
+  }
+
+  function toggleLabels() {
+    const grid = document.getElementById('grid');
+    grid.classList.toggle('hide-labels', !document.getElementById('labelToggle').checked);
+  }
+
+  loadCameras();
+</script>
+
+{% endblock %}

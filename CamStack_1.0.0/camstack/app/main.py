@@ -1,13 +1,14 @@
 from __future__ import annotations
 from pathlib import Path
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from loguru import logger
-import subprocess, json, asyncio, uuid
+import subprocess, json, asyncio, uuid, threading, time
 from datetime import datetime, timezone
+import cv2
 
 from .discovery import onvif_discover
 from .overlay_gen import write_overlay, get_first_ipv4
@@ -560,3 +561,147 @@ def get_motion_events():
     except Exception as e:
         logger.exception("Failed to get motion events")
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# MJPEG Live Stream Proxy
+# ---------------------------------------------------------------------------
+
+class _CamGrabber:
+    """
+    Background thread that maintains a persistent cv2.VideoCapture for one
+    RTSP URL, JPEG-encodes every frame, and exposes the latest bytes.
+    One instance is shared across all HTTP clients watching the same camera.
+    """
+
+    _RECONNECT_DELAY = 5.0
+    _JPEG_QUALITY = 72
+
+    def __init__(self, camera_id: str, rtsp_url: str) -> None:
+        self.camera_id = camera_id
+        self.rtsp_url = rtsp_url
+        self._latest: bytes | None = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"mjpeg-{camera_id}"
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        logger.info(f"[MJPEG] Starting grabber for {self.camera_id}")
+        while not self._stop.is_set():
+            cap = cv2.VideoCapture(self.rtsp_url)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if not cap.isOpened():
+                logger.warning(f"[MJPEG] Could not open {self.camera_id}, retrying in {self._RECONNECT_DELAY}s")
+                self._stop.wait(self._RECONNECT_DELAY)
+                continue
+            logger.info(f"[MJPEG] Connected to {self.camera_id}")
+            while not self._stop.is_set():
+                ret, frame = cap.read()
+                if not ret:
+                    logger.warning(f"[MJPEG] Frame read failed for {self.camera_id}, reconnecting")
+                    break
+                # Scale down to a web-friendly width while preserving aspect ratio
+                h, w = frame.shape[:2]
+                if w > 960:
+                    frame = cv2.resize(frame, (960, int(h * 960 / w)))
+                ok, buf = cv2.imencode(
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self._JPEG_QUALITY]
+                )
+                if ok:
+                    with self._lock:
+                        self._latest = buf.tobytes()
+            cap.release()
+            if not self._stop.is_set():
+                self._stop.wait(self._RECONNECT_DELAY)
+        logger.info(f"[MJPEG] Grabber stopped for {self.camera_id}")
+
+    def latest(self) -> bytes | None:
+        with self._lock:
+            return self._latest
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+class _MjpegStreamManager:
+    """Lazily creates one _CamGrabber per camera_id, shared across clients."""
+
+    def __init__(self) -> None:
+        self._grabbers: dict[str, _CamGrabber] = {}
+        self._lock = threading.Lock()
+
+    def _resolve_rtsp(self, camera_id: str) -> str | None:
+        """Look up RTSP URL from motion config or discovered cameras store."""
+        # Motion detection config (primary source — always has validated URLs)
+        try:
+            if CFG.exists():
+                cfg = json.loads(CFG.read_text())
+                cam_cfg = cfg.get("motion_detection", {}).get("cameras", {}).get(camera_id)
+                if cam_cfg:
+                    return cam_cfg.get("rtsp_url")
+        except Exception:
+            pass
+        # Discovered cameras store
+        try:
+            store = _load_discovered_store()
+            for cam in store.get("cameras", []):
+                if cam.get("ip") == camera_id:
+                    return cam.get("rtsp_url")
+        except Exception:
+            pass
+        return None
+
+    def get(self, camera_id: str) -> _CamGrabber | None:
+        with self._lock:
+            if camera_id not in self._grabbers:
+                rtsp_url = self._resolve_rtsp(camera_id)
+                if not rtsp_url:
+                    return None
+                self._grabbers[camera_id] = _CamGrabber(camera_id, rtsp_url)
+            return self._grabbers[camera_id]
+
+    def stop_all(self) -> None:
+        with self._lock:
+            for g in self._grabbers.values():
+                g.stop()
+            self._grabbers.clear()
+
+
+_stream_manager = _MjpegStreamManager()
+
+
+async def _mjpeg_generator(grabber: _CamGrabber):
+    """Async generator that yields MJPEG frames for StreamingResponse."""
+    boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+    while True:
+        frame = grabber.latest()
+        if frame:
+            yield boundary + frame + b"\r\n"
+        await asyncio.sleep(0.04)  # ~25fps cap; actual rate limited by grabber
+
+
+@app.get("/stream/{camera_id:path}")
+async def stream_camera(camera_id: str):
+    """
+    MJPEG stream for a single camera.  camera_id is the camera's IP address.
+    Browsers can embed this directly in an <img src="/stream/192.168.4.49">.
+    """
+    grabber = _stream_manager.get(camera_id)
+    if grabber is None:
+        return JSONResponse({"error": f"Unknown camera: {camera_id}"}, status_code=404)
+    return StreamingResponse(
+        _mjpeg_generator(grabber),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/live", response_class=HTMLResponse)
+def live_page(request: Request):
+    """Live camera feed grid page."""
+    return templates.TemplateResponse("live.html", {
+        "request": request,
+        "version": VERSION,
+    })
