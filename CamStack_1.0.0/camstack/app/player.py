@@ -475,7 +475,10 @@ def _spawn_player(url: str) -> tuple[list[subprocess.Popen], subprocess.Popen, l
             return [mpv_proc], mpv_proc, []
         # Resolution failed — let mpv use its own ytdl-hook as a fallback.
         logger.warning("[Player] Direct URL resolution failed; trying mpv ytdl-hook")
-    mpv_proc = subprocess.Popen(_build_mpv_cmd(url), stderr=subprocess.DEVNULL)
+        mpv_proc = subprocess.Popen(_build_mpv_cmd(url, use_ytdl=True), stderr=subprocess.DEVNULL)
+        return [mpv_proc], mpv_proc, []
+    # Non-YouTube URL (e.g. RTSP): no ytdl options needed.
+    mpv_proc = subprocess.Popen(_build_mpv_cmd(url, use_ytdl=False), stderr=subprocess.DEVNULL)
     return [mpv_proc], mpv_proc, []
 
 def _terminate_proc(proc: subprocess.Popen, timeout: int = 10) -> None:
@@ -891,6 +894,10 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     last_ambient_update = 0.0
     last_frame_path: Optional[Path] = None
     last_successful_frame_at = time.monotonic()
+    startup_time = time.monotonic()
+    # Allow this many seconds for RTSP connections and NatureGrabber to produce
+    # their first frames before any offline checks are permitted to fire.
+    _STARTUP_GRACE = 20.0
     frame_fail_counts: dict[str, int] = {cam_id: 0 for cam_id, _ in enabled_cameras}
     all_offline_fail_threshold = 3
     offline_frame_timeout = max(12.0, (rotation_interval * len(enabled_cameras)) + 3.0)
@@ -984,19 +991,26 @@ def launch_with_motion_detection(motion_config: dict) -> int:
             # If all monitored cameras have failed/been disabled, stop showing
             # stale camera imagery and switch to nature fallback behavior.
             camera_states = detector.get_camera_states()
+            startup_done = (now - startup_time) >= _STARTUP_GRACE
             all_cameras_offline = bool(camera_states) and all(
                 (not st.get("enabled", True)) for st in camera_states.values()
             )
+            # In ambient mode the nature feed fills the screen; camera tiles are
+            # overlays only.  A camera having no frames just means its Q4 tile is
+            # absent — that is NOT an all-offline condition.  Only check snapshot
+            # failures when there is no nature grabber (single-camera / mpv mode).
             all_snapshots_failing = (
-                bool(frame_fail_counts)
-                and all(count >= all_offline_fail_threshold for count in frame_fail_counts.values())
-                and (nature_grabber is None or nature_grabber.latest_frame is None)
-            )
-            # Don't time-out when nature_grabber is active — it provides ambient content
-            # even if cameras are temporarily unreachable.
-            frame_timeout_exceeded = (
-                (now - last_successful_frame_at) >= offline_frame_timeout
+                startup_done
                 and nature_grabber is None
+                and bool(frame_fail_counts)
+                and all(count >= all_offline_fail_threshold for count in frame_fail_counts.values())
+            )
+            # Frame-timeout check also skipped in ambient mode — nature stream
+            # keeps the display alive even when cameras are temporarily offline.
+            frame_timeout_exceeded = (
+                startup_done
+                and nature_grabber is None
+                and (now - last_successful_frame_at) >= offline_frame_timeout
             )
 
             if all_cameras_offline or all_snapshots_failing or frame_timeout_exceeded:
