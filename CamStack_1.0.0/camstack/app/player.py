@@ -316,7 +316,7 @@ def _resolve_ytdlp_url(youtube_url: str) -> Optional[str]:
         result = subprocess.run(
             [
                 "yt-dlp",
-                "--format", "best[height<=480]/best",
+                "--format", "best[height<=720]/best",
                 "--extractor-args", "youtube:player_client=android",
                 "--no-playlist",
                 "-g", youtube_url,
@@ -351,7 +351,7 @@ def _resolve_ytdlp_with_title(youtube_url: str, timeout: int = 50) -> Optional[t
         result = subprocess.run(
             [
                 "yt-dlp", "--no-warnings",
-                "--format", "best[height<=480]/best",
+                "--format", "best[height<=720]/best",
                 "--extractor-args", "youtube:player_client=android",
                 "--no-playlist", "-J", youtube_url,
             ],
@@ -397,7 +397,7 @@ class NatureGrabber:
     """
 
     _REFRESH_INTERVAL: float = 1800.0   # re-resolve stream URL every 30 min
-    _IDLE_FPS: float = 12.0              # RPi4 can comfortably sustain 12fps software-decode
+    _IDLE_FPS: float = 25.0              # RPi5 Cortex-A76 handles 25fps software-decode comfortably
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -503,8 +503,8 @@ def _build_mpv_cmd(url: str, use_ytdl: bool = True) -> list[str]:
         "--no-border", "-msg-level=all=info,ffmpeg=info",
         "--log-file=/opt/camstack/runtime/mpv-debug.log",
         "--network-timeout=15", "--rtsp-transport=tcp",
-        "--demuxer-max-bytes=32MiB", "--cache-secs=10",
-        "--demuxer-readahead-secs=5",
+        "--demuxer-max-bytes=64MiB", "--cache-secs=30",
+        "--demuxer-readahead-secs=10",
     ]
     if use_ytdl:
         cmd.extend(
@@ -518,7 +518,7 @@ def _build_mpv_cmd(url: str, use_ytdl: bool = True) -> list[str]:
                 "--http-header-fields=Referer: https://www.youtube.com/",
                 "--http-header-fields=Origin: https://www.youtube.com",
                 "--script-opts=ytdl_hook-ytdl_path=yt-dlp",
-                "--ytdl-format=best[height<=480]/best",
+                "--ytdl-format=best[height<=720]/best",
                 "--ytdl-raw-options=force-ipv4=yes,extractor-args=youtube:player_client=android",
             ]
         )
@@ -897,8 +897,8 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     frame_threshold = motion_config.get("frame_threshold", 2)
     diff_threshold = motion_config.get("diff_threshold", 8)
     rotation_interval = motion_config.get("rotation_interval", 20)
-    idle_fps = motion_config.get("idle_fps", 5.0)
-    active_fps = motion_config.get("active_fps", 15.0)
+    idle_fps = motion_config.get("idle_fps", 10.0)
+    active_fps = motion_config.get("active_fps", 25.0)
     ring_seconds = motion_config.get("ring_seconds", 180.0)
     k_enter = motion_config.get("k_enter", 5)
     k_disarm = motion_config.get("k_disarm", 2)
@@ -955,9 +955,9 @@ def launch_with_motion_detection(motion_config: dict) -> int:
     motion_mode = False
     display_interval = max(0.15, min(1.0, snapshot_interval))
     last_display_update = 0.0
-    # Ambient nature feed renders independently at ~20fps, decoupled from the
+    # Ambient nature feed renders independently at ~30fps, decoupled from the
     # camera snapshot_interval which only needs to be as fast as ffmpeg grabs.
-    _ambient_interval = 1.0 / 20.0
+    _ambient_interval = 1.0 / 30.0
     last_ambient_update = 0.0
     last_frame_path: Optional[Path] = None
     last_successful_frame_at = time.monotonic()
@@ -1165,7 +1165,7 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                             clip_path,
                             display,
                             annotation=annotation,
-                            fps=8,
+                            fps=15,
                             speed=clip_playback_speed,
                             abort_check=lambda: bool(detector.check_all_cameras()),
                         )
@@ -1234,7 +1234,7 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                         display.show_image(show_path)
                 last_display_update = now
 
-            time.sleep(0.033)  # ~30Hz tick — fast enough to service 20fps ambient renders
+            time.sleep(0.016)  # ~60Hz tick — fine-grained timing for 30fps ambient renders
             
     except KeyboardInterrupt:
         logger.info("Motion detection interrupted by user")
