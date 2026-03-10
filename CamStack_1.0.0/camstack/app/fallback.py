@@ -11,9 +11,11 @@ from typing import Iterable
 import requests
 
 EXPLORE_LIVE_URLS = [
-    "https://www.youtube.com/watch?v=V7uiqRCW6I8",
-    "https://www.youtube.com/@ExploreLiveNatureCams/live",
-    "https://www.youtube.com/playlist?list=PLkAmZAcQ2jdpuIim_aop0pVq1z5vdL164",
+    "https://www.youtube.com/@BBCEarth/live",
+    "https://www.youtube.com/@WildEarth/live",
+    "https://www.youtube.com/@MontereyBayAquarium/live",
+    "https://www.youtube.com/@NatGeo/live",
+    "https://www.youtube.com/@AnimalPlanet/live",
 ]
 
 # Subreddits to search for nature webcam discussions

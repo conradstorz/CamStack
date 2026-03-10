@@ -12,6 +12,7 @@ from .overlay_gen import write_overlay
 from .fallback import (
     get_featured_fallback_url,
     get_best_live_stream,
+    get_reddit_nature_cams,
     LiveStreamInfo,
     load_cached_stream,
     save_cached_stream,
@@ -338,6 +339,7 @@ _NATURE_REJECT: frozenset[str] = frozenset({
     "gaming", "game", "minecraft", "fortnite", "twitch", "esport",
     "movie", "film", "trailer", "comedy", "funny", "meme",
     "news", "politics", "sports", "football", "basketball",
+    "jellyfish",
 })
 
 
@@ -437,7 +439,7 @@ class NatureGrabber:
                 resolved_url: Optional[str] = None
                 # Shuffle the candidate pool and try each until one passes
                 # content validation (title must not match _NATURE_REJECT).
-                pool = list(EXPLORE_LIVE_URLS)
+                pool = list(EXPLORE_LIVE_URLS) + get_reddit_nature_cams()
                 _random.shuffle(pool)
                 for candidate in pool:
                     result = _resolve_ytdlp_with_title(candidate)
