@@ -8,7 +8,7 @@ import math
 import numpy as np
 import cv2
 from PIL import Image, ImageTk
-from .overlay_gen import write_overlay
+from .overlay_gen import write_overlay, get_first_ipv4, VERSION
 from .fallback import (
     get_featured_fallback_url,
     get_best_live_stream,
@@ -821,6 +821,7 @@ def _compose_ambient_frame(
     camera_frames: list[tuple[str, np.ndarray]],
     screen_w: int,
     screen_h: int,
+    server_label: str = "",
 ) -> np.ndarray:
     """
     Compose a fullscreen ambient display frame.
@@ -879,6 +880,29 @@ def _compose_ambient_frame(
 
     # Subtle border around the entire camera quadrant
     cv2.rectangle(base, (qx, qy), (screen_w - 1, screen_h - 1), (70, 70, 70), 2)
+
+    # CamStack server IP label — top-left corner of the nature feed area
+    if server_label:
+        lbl_scale = max(0.4, screen_h / 1600.0)
+        lbl_thickness = 1
+        (lbl_w, lbl_h), baseline = cv2.getTextSize(
+            server_label, cv2.FONT_HERSHEY_SIMPLEX, lbl_scale, lbl_thickness
+        )
+        pad = 6
+        # Semi-transparent dark backing rectangle
+        overlay_roi = base[pad : pad + lbl_h + baseline + pad * 2,
+                           pad : pad + lbl_w + pad * 2]
+        dark = overlay_roi.copy()
+        cv2.rectangle(dark, (0, 0), (dark.shape[1] - 1, dark.shape[0] - 1), (0, 0, 0), -1)
+        cv2.addWeighted(dark, 0.55, overlay_roi, 0.45, 0, overlay_roi)
+        base[pad : pad + lbl_h + baseline + pad * 2,
+             pad : pad + lbl_w + pad * 2] = overlay_roi
+        cv2.putText(
+            base, server_label,
+            (pad * 2, pad + lbl_h + pad // 2),
+            cv2.FONT_HERSHEY_SIMPLEX, lbl_scale,
+            (220, 220, 220), lbl_thickness, cv2.LINE_AA,
+        )
 
     return base
 
@@ -977,6 +1001,9 @@ def launch_with_motion_detection(motion_config: dict) -> int:
         logger.warning(f"Still-frame display unavailable, falling back to mpv switching: {e}")
         display = None
     display_capable = display is not None
+
+    _server_ip = get_first_ipv4()
+    _server_label = f"CamStack v{VERSION}  \u2022  https://{_server_ip}/"
 
     # Ambient nature-feed: nature fills the screen when no camera has active motion.
     ambient_nature_feed: bool = motion_config.get("ambient_nature_feed", True)
@@ -1192,7 +1219,8 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                     if n_frame is not None or cam_tiles:
                         last_successful_frame_at = now
                     composite = _compose_ambient_frame(
-                        n_frame, cam_tiles, display._width, display._height
+                        n_frame, cam_tiles, display._width, display._height,
+                        server_label=_server_label,
                     )
                     display.show_np_frame(composite)
                     last_ambient_update = now
@@ -1215,9 +1243,12 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                     frame_fail_counts[current_camera_id] = 0
                     last_successful_frame_at = now
                     ago = motion_memory.time_since_motion(current_camera_id)
+                    ann_parts = [current_camera_id]
                     if ago:
-                        ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
-                        frame_path = _annotate_frame(frame_path, f"Last motion: {ago}", ann_path)
+                        ann_parts.append(f"Last motion: {ago}")
+                    ann_parts.append(_server_label)
+                    ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
+                    frame_path = _annotate_frame(frame_path, "  \u2022  ".join(ann_parts), ann_path)
                     if display.show_image(frame_path):
                         last_frame_path = frame_path
                 else:
@@ -1226,13 +1257,14 @@ def launch_with_motion_detection(motion_config: dict) -> int:
                     )
                     if last_frame_path is not None:
                         ago = motion_memory.time_since_motion(current_camera_id)
+                        stale_parts = [current_camera_id]
                         if ago:
-                            ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
-                            show_path = _annotate_frame(
-                                last_frame_path, f"Last motion: {ago}", ann_path
-                            )
-                        else:
-                            show_path = last_frame_path
+                            stale_parts.append(f"Last motion: {ago}")
+                        stale_parts.append(_server_label)
+                        ann_path = SNAP_DIR / f"annotated_{_safe_camera_id(current_camera_id)}.jpg"
+                        show_path = _annotate_frame(
+                            last_frame_path, "  \u2022  ".join(stale_parts), ann_path
+                        )
                         display.show_image(show_path)
                 last_display_update = now
 
