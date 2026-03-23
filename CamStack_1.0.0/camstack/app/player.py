@@ -4,7 +4,6 @@ import subprocess, json, time, signal, threading, os
 from dataclasses import dataclass
 from typing import Optional
 from loguru import logger
-import math
 import numpy as np
 import cv2
 from PIL import Image, ImageTk
@@ -339,7 +338,7 @@ _NATURE_REJECT: frozenset[str] = frozenset({
     "gaming", "game", "minecraft", "fortnite", "twitch", "esport",
     "movie", "film", "trailer", "comedy", "funny", "meme",
     "news", "politics", "sports", "football", "basketball",
-    "jellyfish",
+    "jellyfish", "monterey",
 })
 
 
@@ -740,15 +739,16 @@ def launch_rtsp_with_watchdog() -> int:
     # Notify systemd we're ready
     subprocess.run(["systemd-notify", "--ready"], check=False, capture_output=True)
     
-    # Check if motion detection is enabled
+    # Launch multi-camera ambient display whenever cameras are configured.
+    # motion_detection.enabled only controls recording behaviour, not the display.
     motion_config = _load_motion_config()
-    if motion_config and motion_config.get("enabled", False):
-        logger.info("Motion detection enabled - launching multi-camera mode")
+    if motion_config and motion_config.get("cameras"):
+        logger.info("Cameras configured — launching multi-camera ambient display")
         while True:
             rc = launch_with_motion_detection(motion_config)
             if rc != CAMERA_RECOVERED:
                 return rc
-            logger.info("Cameras back online — re-entering motion detection mode")
+            logger.info("Cameras back online — re-entering multi-camera display")
             motion_config = _load_motion_config() or motion_config
     
     # Standard single-camera mode
@@ -826,62 +826,58 @@ def _compose_ambient_frame(
     """
     Compose a fullscreen ambient display frame.
 
-    Nature footage fills the entire screen as the background.  Camera
-    tiles are overlaid in the bottom-right quadrant (Q4), subdivided
-    into a grid that fits all active cameras simultaneously.
+    Layout:
+      - Top 3/4 of screen height: 16:9 nature video window anchored top-left,
+        with blank space reserved on the right for future camera tiles.
+      - Bottom 1/4 of screen: IP cameras in a horizontal row (full width).
     """
-    # Base: nature scaled to screen, or solid black while buffering
+    base = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+
+    # ── Nature window: 16:9 box that fills the top-3/4 height, anchored left ──
+    nature_h = (screen_h * 3) // 4
+    nature_w = min(screen_w, (nature_h * 16) // 9)   # 16:9, never wider than screen
     if nature_frame is not None:
-        base = cv2.resize(nature_frame, (screen_w, screen_h))
-    else:
-        base = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+        resized = cv2.resize(nature_frame, (nature_w, nature_h))
+        base[0:nature_h, 0:nature_w] = resized
 
-    if not camera_frames:
-        return base
+    # ── Camera strip: bottom 1/4 of screen, horizontal row ──
+    strip_y = nature_h
+    strip_h = screen_h - strip_y
 
-    # Bottom-right quadrant
-    qx = screen_w // 2
-    qy = screen_h // 2
-    qw = screen_w - qx
-    qh = screen_h - qy
+    # Thin divider line between nature area and camera strip
+    cv2.line(base, (0, strip_y), (screen_w, strip_y), (70, 70, 70), 2)
 
-    n = len(camera_frames)
-    cols = math.ceil(math.sqrt(n))
-    rows = math.ceil(n / cols)
-    tile_w = max(1, qw // cols)
-    tile_h = max(1, qh // rows)
+    if camera_frames:
+        n = len(camera_frames)
+        tile_w = max(1, screen_w // n)
+        tile_h = strip_h
 
-    for idx, (cam_id, cam_frame) in enumerate(camera_frames):
-        col = idx % cols
-        row = idx // cols
-        x0 = qx + col * tile_w
-        y0 = qy + row * tile_h
-        x1 = min(screen_w, x0 + tile_w)
-        y1 = min(screen_h, y0 + tile_h)
-        tw, th = x1 - x0, y1 - y0
-        if tw <= 0 or th <= 0:
-            continue
+        for idx, (cam_id, cam_frame) in enumerate(camera_frames):
+            x0 = idx * tile_w
+            x1 = min(screen_w, x0 + tile_w) if idx < n - 1 else screen_w
+            y0 = strip_y
+            y1 = screen_h
+            tw, th = x1 - x0, y1 - y0
+            if tw <= 0 or th <= 0:
+                continue
 
-        tile = cv2.resize(cam_frame, (tw, th))
+            tile = cv2.resize(cam_frame, (tw, th))
 
-        # Thin separator border
-        cv2.rectangle(tile, (0, 0), (tw - 1, th - 1), (50, 50, 50), 1)
+            # Thin separator border
+            cv2.rectangle(tile, (0, 0), (tw - 1, th - 1), (50, 50, 50), 1)
 
-        # Camera ID label (bottom-left corner of tile)
-        label = cam_id if len(cam_id) <= 18 else cam_id[-18:]
-        font_scale = max(0.3, th / 240.0)
-        cv2.putText(
-            tile, label, (4, th - 6),
-            cv2.FONT_HERSHEY_SIMPLEX, font_scale,
-            (220, 220, 220), 1, cv2.LINE_AA,
-        )
+            # Camera ID label (bottom-left corner of tile)
+            label = cam_id if len(cam_id) <= 18 else cam_id[-18:]
+            font_scale = max(0.3, th / 240.0)
+            cv2.putText(
+                tile, label, (4, th - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                (220, 220, 220), 1, cv2.LINE_AA,
+            )
 
-        base[y0:y1, x0:x1] = tile
+            base[y0:y1, x0:x1] = tile
 
-    # Subtle border around the entire camera quadrant
-    cv2.rectangle(base, (qx, qy), (screen_w - 1, screen_h - 1), (70, 70, 70), 2)
-
-    # CamStack server IP label — top-left corner of the nature feed area
+    # CamStack server IP label — top-left corner of the nature area
     if server_label:
         lbl_scale = max(0.4, screen_h / 1600.0)
         lbl_thickness = 1
@@ -1021,9 +1017,13 @@ def launch_with_motion_detection(motion_config: dict) -> int:
         cam_id: None for cam_id, _ in enabled_cameras
     }
 
-    # Wire the on_confirmed callback: fires once per motion event with the
-    # pre-event ring-buffer snapshot so recording captures context before trigger.
+    # Wire the on_confirmed callback only when motion recording is enabled.
+    # The ambient display runs regardless; this flag only gates clip recording.
+    motion_recording_enabled: bool = motion_config.get("enabled", False)
+
     def _on_motion_confirmed(camera_id: str, pre_frames) -> None:  # type: ignore[type-arg]
+        if not motion_recording_enabled:
+            return
         cam_url = _camera_url_map.get(camera_id)
         if cam_url:
             cam_score = (
