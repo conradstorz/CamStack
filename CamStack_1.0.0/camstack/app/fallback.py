@@ -2,99 +2,72 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import random
-import re
 import subprocess
 import time
 from pathlib import Path
 from typing import Iterable
 
-import requests
-
+# Curated list of reliable 24/7 nature & wildlife live streams.
+# All are YouTube channel /live pages which yt-dlp can resolve to the
+# current live broadcast automatically.
 EXPLORE_LIVE_URLS = [
+    # ── Broad nature / wildlife ──
     "https://www.youtube.com/@BBCEarth/live",
     "https://www.youtube.com/@WildEarth/live",
-    "https://www.youtube.com/@MontereyBayAquarium/live",
     "https://www.youtube.com/@NatGeo/live",
     "https://www.youtube.com/@AnimalPlanet/live",
+    "https://www.youtube.com/@ExploreOrg/live",          # 100+ live cams (bears, eagles, wolves)
+    "https://www.youtube.com/@Africam/live",             # African game-reserve cams
+    "https://www.youtube.com/@AfricanWildlifeFdn/live",
+
+    # ── Bird cams ──
+    "https://www.youtube.com/@CornellLabBirdCams/live",  # feeder & nest cams, very stable
+    "https://www.youtube.com/@AudubonSociety/live",
+
+    # ── Zoo & aquarium (nature-only) ──
+    "https://www.youtube.com/@SanDiegoZoo/live",
+    "https://www.youtube.com/@SmithsonianNationalZoo/live",
+    "https://www.youtube.com/@Cincinnati_Zoo/live",
+
+    # ── National parks & landscapes ──
+    "https://www.youtube.com/@YellowstoneNPS/live",
+    "https://www.youtube.com/@VisitNorway/live",         # fjords & northern lights
+    "https://www.youtube.com/@NorskNatur/live",          # Norwegian wildlife
+
+    # ── Ocean & marine ──
+    "https://www.youtube.com/@OceanExplorationTrust/live",
+    "https://www.youtube.com/@NOAAOceanExplorer/live",
+
+    # ── Misc reliable 24/7 nature ──
+    "https://www.youtube.com/@EarthCam/live",
+    "https://www.youtube.com/@NatureRelaxation/live",
 ]
-
-# Subreddits to search for nature webcam discussions
-REDDIT_SOURCES = [
-    "r/NatureLive",
-    "r/livestreaming",
-    "r/nature",
-    "r/camping",
-    "r/Outdoors",
-    "r/wildlife",
-]
-
-REDDIT_SEARCH_QUERIES = [
-    "nature webcam",
-    "wildlife webcam",
-    "live nature stream",
-    "animal webcam",
-    "nature cam live",
-]
-
-# Words that must appear in a post title for it to be considered nature-related.
-# Deliberately excludes generic words like "live", "stream", "cam", "camera"
-# which appear in too many non-nature contexts.
-_NATURE_KEYWORDS: frozenset[str] = frozenset({
-    "nature", "wildlife", "wild", "animal", "bird", "birds", "wolf", "wolves",
-    "bear", "bears", "eagle", "deer", "fox", "owl", "nest", "feeder",
-    "webcam", "forest", "ocean", "river", "lake", "pond", "safari", "habitat",
-    "explore", "outdoor", "garden",
-})
-
-# If any of these appear in a post title the post is rejected outright,
-# regardless of any nature keywords also present.
-_REJECT_KEYWORDS: frozenset[str] = frozenset({
-    "music", "song", "opera", "concert", "album", "band", "singer", "vocals",
-    "lyrics", "playlist", "soundtrack",
-    "gaming", "game", "minecraft", "fortnite", "twitch", "esport",
-    "movie", "film", "trailer", "comedy", "funny", "meme",
-    "news", "politics", "sports", "football", "basketball", "soccer",
-})
-
-
-def _is_nature_related_post(post: RedditPost) -> bool:
-    """Return True only if the post title looks like a live nature/wildlife cam."""
-    words = set(re.findall(r"[a-z]+", post.title.lower()))
-    if words & _REJECT_KEYWORDS:
-        return False
-    return bool(words & _NATURE_KEYWORDS)
 
 RUNTIME = Path("/opt/camstack/runtime")
 CACHE_FILE = RUNTIME / "fallback.json"
-REDDIT_CACHE_FILE = RUNTIME / "reddit_cams.json"
+
+
+def get_reddit_nature_cams(use_cache: bool = True, max_age: int = 7200) -> list[str]:
+    """Stub — Reddit discovery removed in favour of the curated EXPLORE_LIVE_URLS list."""
+    return []
+
 
 def get_featured_fallback_url(use_reddit: bool = True, exclude: set[str] | None = None) -> str:
-    """
-    Get a random featured fallback URL, optionally excluding known-bad URLs.
-
-    Args:
-        use_reddit: If True, includes Reddit-discovered URLs in the selection
-        exclude: Set of URLs to skip; falls back to full pool if all are excluded
-
-    Returns:
-        A random URL from available sources
-    """
+    """Return a random URL from the curated nature-cam pool, skipping any blocked entries."""
     urls = list(EXPLORE_LIVE_URLS)
-    if use_reddit:
-        reddit_urls = get_reddit_nature_cams()
-        if reddit_urls:
-            urls.extend(reddit_urls)
     if exclude:
         filtered = [u for u in urls if u not in exclude]
         if filtered:
             urls = filtered
     return random.choice(urls)
 
+
 @dataclass(frozen=True)
 class LiveStreamInfo:
     url: str
     title: str | None
     viewers: int
+
 
 def load_cached_stream(max_age: int = 3600) -> LiveStreamInfo | None:
     try:
@@ -109,6 +82,7 @@ def load_cached_stream(max_age: int = 3600) -> LiveStreamInfo | None:
         return None
     return LiveStreamInfo(url=url, title=data.get("title"), viewers=int(data.get("viewers", 0)))
 
+
 def save_cached_stream(info: LiveStreamInfo) -> None:
     try:
         payload = {
@@ -121,147 +95,6 @@ def save_cached_stream(info: LiveStreamInfo) -> None:
     except Exception:
         pass
 
-def _extract_youtube_urls(text: str) -> list[str]:
-    """Extract YouTube URLs from text using regex."""
-    if not text:
-        return []
-    patterns = [
-        r'https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+',
-        r'https?://(?:www\.)?youtube\.com/@[\w-]+/live',
-        r'https?://(?:www\.)?youtube\.com/channel/[\w-]+/live',
-        r'https?://youtu\.be/[\w-]+',
-        r'https?://(?:www\.)?youtube\.com/embed/[\w-]+',
-    ]
-    urls = []
-    for pattern in patterns:
-        urls.extend(re.findall(pattern, text, re.IGNORECASE))
-    return list(set(urls))  # Remove duplicates
-
-@dataclass(frozen=True)
-class RedditPost:
-    """Represents a Reddit post with popularity metrics."""
-    title: str
-    url: str
-    score: int
-    num_comments: int
-    selftext: str
-    
-    @property
-    def popularity(self) -> int:
-        """Combined popularity score (upvotes + comments)."""
-        return self.score + self.num_comments
-
-def _fetch_reddit_posts(subreddit: str, sort: str = "hot", limit: int = 25, time_filter: str = "week") -> list[RedditPost]:
-    """Fetch posts from a subreddit using Reddit's public JSON API."""
-    try:
-        url = f"https://www.reddit.com/{subreddit}/{sort}.json"
-        params = {"limit": limit, "t": time_filter} if sort == "top" else {"limit": limit}
-        headers = {"User-Agent": "CamStack/1.0"}
-        
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return []
-        
-        data = response.json()
-        posts = []
-        for child in data.get("data", {}).get("children", []):
-            post_data = child.get("data", {})
-            posts.append(RedditPost(
-                title=post_data.get("title", ""),
-                url=post_data.get("url", ""),
-                score=post_data.get("score", 0),
-                num_comments=post_data.get("num_comments", 0),
-                selftext=post_data.get("selftext", ""),
-            ))
-        return posts
-    except Exception:
-        return []
-
-def _search_reddit(query: str, limit: int = 25, time_filter: str = "week") -> list[RedditPost]:
-    """Search Reddit for posts matching a query."""
-    try:
-        url = "https://www.reddit.com/search.json"
-        params = {"q": query, "limit": limit, "t": time_filter, "sort": "relevance"}
-        headers = {"User-Agent": "CamStack/1.0"}
-        
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return []
-        
-        data = response.json()
-        posts = []
-        for child in data.get("data", {}).get("children", []):
-            post_data = child.get("data", {})
-            posts.append(RedditPost(
-                title=post_data.get("title", ""),
-                url=post_data.get("url", ""),
-                score=post_data.get("score", 0),
-                num_comments=post_data.get("num_comments", 0),
-                selftext=post_data.get("selftext", ""),
-            ))
-        return posts
-    except Exception:
-        return []
-
-def get_reddit_nature_cams(use_cache: bool = True, max_age: int = 7200) -> list[str]:
-    """
-    Discover popular nature webcam URLs from Reddit discussions.
-    
-    Returns a list of YouTube URLs, ranked by Reddit popularity (upvotes + comments).
-    Results are cached for 2 hours by default.
-    """
-    # Check cache first
-    if use_cache:
-        try:
-            cache_data = json.loads(REDDIT_CACHE_FILE.read_text())
-            ts = int(cache_data.get("timestamp", 0))
-            if ts and time.time() - ts <= max_age:
-                return cache_data.get("urls", [])
-        except Exception:
-            pass
-    
-    # Collect posts from multiple sources
-    all_posts: list[RedditPost] = []
-    
-    # Search specific subreddits
-    for subreddit in REDDIT_SOURCES:
-        all_posts.extend(_fetch_reddit_posts(subreddit, sort="hot", limit=10))
-        all_posts.extend(_fetch_reddit_posts(subreddit, sort="top", limit=15, time_filter="week"))
-    
-    # Search by keywords
-    for query in REDDIT_SEARCH_QUERIES:
-        all_posts.extend(_search_reddit(query, limit=20, time_filter="week"))
-    
-    # Discard posts that don't look like nature/wildlife content
-    all_posts = [p for p in all_posts if _is_nature_related_post(p)]
-
-    # Extract YouTube URLs and rank by popularity
-    url_scores: dict[str, int] = {}
-    for post in all_posts:
-        # Check if the post URL itself is a YouTube link
-        if "youtube.com" in post.url or "youtu.be" in post.url:
-            url_scores[post.url] = max(url_scores.get(post.url, 0), post.popularity)
-        
-        # Extract URLs from title and selftext
-        text_urls = _extract_youtube_urls(f"{post.title} {post.selftext}")
-        for url in text_urls:
-            url_scores[url] = max(url_scores.get(url, 0), post.popularity)
-    
-    # Sort by popularity score
-    ranked_urls = sorted(url_scores.items(), key=lambda x: x[1], reverse=True)
-    result_urls = [url for url, _ in ranked_urls]
-    
-    # Cache the results
-    try:
-        cache_data = {
-            "timestamp": int(time.time()),
-            "urls": result_urls,
-        }
-        REDDIT_CACHE_FILE.write_text(json.dumps(cache_data))
-    except Exception:
-        pass
-    
-    return result_urls
 
 def _yt_dlp_json(url: str, flat: bool = False, timeout: int = 8) -> dict | None:
     cmd = ["yt-dlp", "--no-warnings", "-J"]
@@ -318,25 +151,8 @@ def _viewer_count(data: dict) -> int:
     )
 
 def get_best_live_stream(max_candidates: int = 30, exclude: set[str] | None = None, use_reddit: bool = True) -> LiveStreamInfo | None:
-    """
-    Find the best live nature stream from available sources.
-    
-    Args:
-        max_candidates: Maximum number of stream URLs to check
-        exclude: Set of URLs to skip
-        use_reddit: Whether to include Reddit-discovered URLs as sources
-    
-    Returns:
-        LiveStreamInfo for the stream with the most viewers, or None if no live streams found
-    """
+    """Find the best live nature stream from the curated EXPLORE_LIVE_URLS pool."""
     seed_urls = list(EXPLORE_LIVE_URLS)
-    
-    # Optionally add Reddit-discovered URLs
-    if use_reddit:
-        reddit_urls = get_reddit_nature_cams()
-        # Prioritize Reddit URLs by putting them first
-        seed_urls = reddit_urls + seed_urls
-    
     candidates = _expand_candidate_urls(seed_urls)
     blocked = exclude or set()
     best: LiveStreamInfo | None = None
