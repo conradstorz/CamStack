@@ -150,13 +150,17 @@ class StillFrameDisplay:
         try:
             self._enforce_fullscreen()
             self._refresh_display_size()
+            # BGR → RGB; frame is always uint8 from cv2 so astype is skipped.
             rgb = frame[:, :, ::-1]
-            pil_img = Image.fromarray(rgb.astype("uint8"))
-            resized = pil_img.resize(
-                (max(1, self._width), max(1, self._height)),
-                Image.Resampling.BILINEAR,
-            )
-            self._photo = ImageTk.PhotoImage(resized)
+            pil_img = Image.fromarray(rgb)
+            fh, fw = frame.shape[:2]
+            if fw != self._width or fh != self._height:
+                # Only resize when the composite doesn't already match the display.
+                pil_img = pil_img.resize(
+                    (max(1, self._width), max(1, self._height)),
+                    Image.Resampling.BILINEAR,
+                )
+            self._photo = ImageTk.PhotoImage(pil_img)
             self._label.configure(image=self._photo)
             self.pump()
             return True
@@ -420,14 +424,15 @@ class NatureGrabber:
 
     @property
     def latest_frame(self) -> Optional[np.ndarray]:
+        # No copy needed: the grabber thread only ever replaces self._frame with a
+        # new array (never mutates in-place), so the caller's reference is stable.
         with self._lock:
-            return self._frame.copy() if self._frame is not None else None
+            return self._frame
 
     def _run(self) -> None:
         cap = None
         last_resolve: float = 0.0
         direct_url: Optional[str] = None
-        frame_interval = 1.0 / self._IDLE_FPS
 
         while not self._stop_event.is_set():
             now = time.monotonic()
@@ -456,9 +461,10 @@ class NatureGrabber:
                     direct_url = resolved_url
                     last_resolve = now
                     cap = cv2.VideoCapture(direct_url)
-                    # Larger buffer smooths over HLS segment boundaries
-                    # (~2-second segments on YouTube live streams).
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 4)
+                    # Buffer size 1: always serve the newest decoded frame.
+                    # A larger buffer causes the reader to fall behind the live
+                    # edge when the display loop throttles reads to 30 Hz.
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     logger.info(f"[NatureGrabber] Stream opened: {direct_url[:80]}\u2026")
                 else:
                     logger.warning("[NatureGrabber] All candidates failed or rejected; retrying in 60 s")
@@ -480,8 +486,9 @@ class NatureGrabber:
 
             with self._lock:
                 self._frame = frame
-
-            self._stop_event.wait(frame_interval)
+            # No sleep: read as fast as cv2 delivers frames.  The display loop
+            # already throttles rendering to _ambient_interval (1/30 s), so
+            # the grabber just keeps latest_frame as fresh as possible.
 
         if cap is not None:
             cap.release()
