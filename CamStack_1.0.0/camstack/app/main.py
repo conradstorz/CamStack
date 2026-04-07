@@ -37,6 +37,13 @@ def _startup():
         DISCOVERED.write_text(json.dumps({"last_scan": None, "cameras": []}, indent=2))
     write_overlay(False)
     logger.add(str(BASE / "logs" / "camstack.log"), rotation="10 MB")
+    logger.add(
+        str(BASE / "logs" / "nature_feed.log"),
+        rotation="10 MB",
+        filter=lambda r: "[NatureGrabber] Selected stream:" in r["message"]
+                         or "[NatureGrabber] Stream opened:" in r["message"],
+        format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
+    )
 
 
 def _now_iso() -> str:

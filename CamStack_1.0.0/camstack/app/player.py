@@ -1088,8 +1088,14 @@ def launch_with_motion_detection(motion_config: dict) -> int:
             # stale camera imagery and switch to nature fallback behavior.
             camera_states = detector.get_camera_states()
             startup_done = (now - startup_time) >= _STARTUP_GRACE
+            # A camera is considered offline when it has been unreachable for
+            # _OFFLINE_FAILURE_THRESHOLD consecutive attempts (matching the
+            # threshold in camera_stream.py that also clears the display frame).
+            _STREAM_OFFLINE_THRESHOLD = 12
             all_cameras_offline = bool(camera_states) and all(
-                (not st.get("enabled", True)) for st in camera_states.values()
+                (not st.get("enabled", True))
+                or (st.get("consecutive_failures", 0) >= _STREAM_OFFLINE_THRESHOLD)
+                for st in camera_states.values()
             )
             # In ambient mode the nature feed fills the screen; camera tiles are
             # overlays only.  A camera having no frames just means its Q4 tile is

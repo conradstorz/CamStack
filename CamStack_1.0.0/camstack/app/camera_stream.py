@@ -37,6 +37,10 @@ ANALYSIS_H = 240
 # Interval (seconds) between reconnect attempts after a capture failure.
 RECONNECT_DELAY = 5.0
 
+# Consecutive open-failures before the stale display frame is cleared so the
+# player correctly sees the camera as offline (12 × 5 s ≈ 60 s).
+_OFFLINE_FAILURE_THRESHOLD = 12
+
 
 class CamStreamState(enum.Enum):
     IDLE = "IDLE"
@@ -128,6 +132,9 @@ class CameraStream:
         # Public motion score (0.0–1.0) — updated each frame, readable from outside
         self._last_motion_score: float = 0.0
 
+        # Consecutive connection-open failures (reset on success).
+        self._consecutive_failures: int = 0
+
         # Threading
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
@@ -180,6 +187,7 @@ class CameraStream:
             "motion_score": round(self._last_motion_score * 100.0, 2),
             "enabled": self._enabled,
             "k_window_sum": int(sum(self._motion_window)),
+            "consecutive_failures": self._consecutive_failures,
         }
 
     def set_sensitivity(self, sensitivity: float) -> None:
@@ -239,7 +247,6 @@ class CameraStream:
     def _run(self) -> None:
         cap: Optional[cv2.VideoCapture] = None
         prev_gray: Optional[np.ndarray] = None
-        consecutive_failures = 0
 
         while not self._stop_event.is_set():
             # Open / reopen capture as needed.
@@ -250,14 +257,19 @@ class CameraStream:
                     prev_gray = None
                 cap = self._open_capture()
                 if cap is None:
-                    consecutive_failures += 1
+                    self._consecutive_failures += 1
                     logger.warning(
-                        f"[{self.camera_id}] Reconnect attempt {consecutive_failures}; "
+                        f"[{self.camera_id}] Reconnect attempt {self._consecutive_failures}; "
                         f"retrying in {RECONNECT_DELAY}s"
                     )
+                    # Once the camera has been unreachable long enough, clear the
+                    # stale display frame so the player correctly treats it as offline.
+                    if self._consecutive_failures >= _OFFLINE_FAILURE_THRESHOLD:
+                        with self._display_lock:
+                            self._latest_display_frame = None
                     self._stop_event.wait(RECONNECT_DELAY)
                     continue
-                consecutive_failures = 0
+                self._consecutive_failures = 0
 
             frame_start = time.monotonic()
 
