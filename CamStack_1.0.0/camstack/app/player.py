@@ -316,7 +316,7 @@ def _resolve_ytdlp_url(youtube_url: str) -> Optional[str]:
         result = subprocess.run(
             [
                 "yt-dlp",
-                "--format", "best[height<=720]/best",
+                "--format", "best[height<=1080]/best",
                 "--extractor-args", "youtube:player_client=android",
                 "--no-playlist",
                 "-g", youtube_url,
@@ -352,7 +352,7 @@ def _resolve_ytdlp_with_title(youtube_url: str, timeout: int = 50) -> Optional[t
         result = subprocess.run(
             [
                 "yt-dlp", "--no-warnings",
-                "--format", "best[height<=720]/best",
+                "--format", "best[height<=1080]/best",
                 "--extractor-args", "youtube:player_client=android",
                 "--no-playlist", "-J", youtube_url,
             ],
@@ -379,7 +379,7 @@ def _resolve_ytdlp_with_title(youtube_url: str, timeout: int = 50) -> Optional[t
         if not url:
             # Fall back: pick the best format by height from the formats list.
             fmts = [f for f in (data.get("formats") or []) if f.get("url")]
-            candidates = [f for f in fmts if (f.get("height") or 9999) <= 480] or fmts
+            candidates = [f for f in fmts if (f.get("height") or 9999) <= 1080] or fmts
             if candidates:
                 url = max(candidates, key=lambda f: f.get("height") or 0).get("url")
         return (url, title) if url else None
@@ -398,7 +398,7 @@ class NatureGrabber:
     """
 
     _REFRESH_INTERVAL: float = 1800.0   # re-resolve stream URL every 30 min
-    _IDLE_FPS: float = 25.0              # RPi5 Cortex-A76 handles 25fps software-decode comfortably
+    _IDLE_FPS: float = 30.0              # matches the 30 Hz ambient display loop
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -519,7 +519,7 @@ def _build_mpv_cmd(url: str, use_ytdl: bool = True) -> list[str]:
                 "--http-header-fields=Referer: https://www.youtube.com/",
                 "--http-header-fields=Origin: https://www.youtube.com",
                 "--script-opts=ytdl_hook-ytdl_path=yt-dlp",
-                "--ytdl-format=best[height<=720]/best",
+                "--ytdl-format=best[height<=1080]/best",
                 "--ytdl-raw-options=force-ipv4=yes,extractor-args=youtube:player_client=android",
             ]
         )
@@ -827,46 +827,33 @@ def _compose_ambient_frame(
     Compose a fullscreen ambient display frame.
 
     Layout:
-      - Top 3/4 of screen height: 16:9 nature video window anchored top-left,
-        with blank space reserved on the right for future camera tiles.
-      - Bottom 1/4 of screen: IP cameras in a horizontal row (full width).
+      - Cameras fill the entire screen in a square-ish grid.
+      - Nature feed rendered as a PIP window in the bottom-right corner
+        (1/4 screen width, 16:9 aspect ratio).
+      - If no cameras are available, nature fills the entire screen.
     """
     base = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
 
-    # ── Nature window: 16:9 box that fills the top-3/4 height, anchored left ──
-    nature_h = (screen_h * 3) // 4
-    nature_w = min(screen_w, (nature_h * 16) // 9)   # 16:9, never wider than screen
-    if nature_frame is not None:
-        resized = cv2.resize(nature_frame, (nature_w, nature_h))
-        base[0:nature_h, 0:nature_w] = resized
-
-    # ── Camera strip: bottom 1/4 of screen, horizontal row ──
-    strip_y = nature_h
-    strip_h = screen_h - strip_y
-
-    # Thin divider line between nature area and camera strip
-    cv2.line(base, (0, strip_y), (screen_w, strip_y), (70, 70, 70), 2)
-
     if camera_frames:
+        # ── Camera grid: fill the entire screen ──
         n = len(camera_frames)
-        tile_w = max(1, screen_w // n)
-        tile_h = strip_h
+        cols = max(1, int(n ** 0.5 + 0.9999))  # ceil(sqrt(n))
+        rows = max(1, (n + cols - 1) // cols)
+        tile_w = screen_w // cols
+        tile_h = screen_h // rows
 
         for idx, (cam_id, cam_frame) in enumerate(camera_frames):
-            x0 = idx * tile_w
-            x1 = min(screen_w, x0 + tile_w) if idx < n - 1 else screen_w
-            y0 = strip_y
-            y1 = screen_h
+            row = idx // cols
+            col = idx % cols
+            x0 = col * tile_w
+            y0 = row * tile_h
+            x1 = x0 + tile_w if col < cols - 1 else screen_w
+            y1 = y0 + tile_h if row < rows - 1 else screen_h
             tw, th = x1 - x0, y1 - y0
             if tw <= 0 or th <= 0:
                 continue
-
             tile = cv2.resize(cam_frame, (tw, th))
-
-            # Thin separator border
             cv2.rectangle(tile, (0, 0), (tw - 1, th - 1), (50, 50, 50), 1)
-
-            # Camera ID label (bottom-left corner of tile)
             label = cam_id if len(cam_id) <= 18 else cam_id[-18:]
             font_scale = max(0.3, th / 240.0)
             cv2.putText(
@@ -874,10 +861,24 @@ def _compose_ambient_frame(
                 cv2.FONT_HERSHEY_SIMPLEX, font_scale,
                 (220, 220, 220), 1, cv2.LINE_AA,
             )
-
             base[y0:y1, x0:x1] = tile
 
-    # CamStack server IP label — top-left corner of the nature area
+        # ── Nature PIP: bottom-right corner, 1/4 screen width, 16:9 ──
+        if nature_frame is not None:
+            pip_w = max(160, screen_w // 4)
+            pip_h = (pip_w * 9) // 16
+            pip_x = screen_w - pip_w - 8
+            pip_y = screen_h - pip_h - 8
+            pip = cv2.resize(nature_frame, (pip_w, pip_h))
+            cv2.rectangle(pip, (0, 0), (pip_w - 1, pip_h - 1), (200, 200, 200), 2)
+            base[pip_y:pip_y + pip_h, pip_x:pip_x + pip_w] = pip
+
+    else:
+        # ── No cameras: nature fills the entire screen ──
+        if nature_frame is not None:
+            base = cv2.resize(nature_frame, (screen_w, screen_h))
+
+    # CamStack server IP label — top-left corner
     if server_label:
         lbl_scale = max(0.4, screen_h / 1600.0)
         lbl_thickness = 1
