@@ -23,6 +23,31 @@ from .motion_memory import MotionMemory, DEFAULT_CLIP_DURATION
 BASE = Path("/opt/camstack")
 CFG = BASE / "runtime/config.json"
 OVL = BASE / "runtime/overlay.ass"
+
+
+def _setup_logging() -> None:
+    """Register file log sinks for the player process."""
+    _LOG_DIR = BASE / "logs"
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logger.add(
+        str(_LOG_DIR / "camplayer.log"),
+        rotation="10 MB",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} - {message}",
+    )
+    logger.add(
+        str(_LOG_DIR / "nature_feed.log"),
+        rotation="10 MB",
+        filter=lambda r: any(tag in r["message"] for tag in (
+            "[NatureGrabber] Selected stream:",
+            "[NatureGrabber] Stream opened:",
+            "[NatureGrabber] Feed started",
+            "[NatureGrabber] Feed stop",
+            "[NatureGrabber] Feed thread exited",
+            "[NatureGrabber] Stream capture released",
+        )),
+        format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
+    )
+    logger.info("CamPlayer log sinks active")
 SNAP_DIR = BASE / "runtime/snaps"
 DEFAULT_STILL = BASE / "runtime/default.jpg"
 CAMERA_RECOVERED = 75   # sentinel: _fallback_loop returns this when cameras come back online
@@ -416,11 +441,14 @@ class NatureGrabber:
             target=self._run, daemon=True, name="nature-grabber"
         )
         self._thread.start()
+        logger.info("[NatureGrabber] Feed started")
 
     def stop(self) -> None:
+        logger.info("[NatureGrabber] Feed stopping")
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
+        logger.info("[NatureGrabber] Feed stopped")
 
     @property
     def latest_frame(self) -> Optional[np.ndarray]:
@@ -492,7 +520,8 @@ class NatureGrabber:
 
         if cap is not None:
             cap.release()
-        logger.debug("[NatureGrabber] Thread exited")
+            logger.info("[NatureGrabber] Stream capture released")
+        logger.info("[NatureGrabber] Feed thread exited")
 
 
 def run_player_once(url: str) -> int:
@@ -718,7 +747,10 @@ def launch_rtsp_then_fallback() -> int:
 def launch_rtsp_with_watchdog() -> int:
     """Launch player with systemd watchdog support and health monitoring."""
     import os, time, signal, threading
-    
+
+    _setup_logging()
+    logger.info(f"CamPlayer v{VERSION} starting up")
+
     # Check if running under systemd with watchdog
     watchdog_usec = os.environ.get("WATCHDOG_USEC")
     watchdog_enabled = watchdog_usec is not None
@@ -754,6 +786,7 @@ def launch_rtsp_with_watchdog() -> int:
         while True:
             rc = launch_with_motion_detection(motion_config)
             if rc != CAMERA_RECOVERED:
+                logger.info(f"CamPlayer shutting down (exit code {rc})")
                 return rc
             logger.info("Cameras back online — re-entering multi-camera display")
             motion_config = _load_motion_config() or motion_config
@@ -776,7 +809,9 @@ def launch_rtsp_with_watchdog() -> int:
     
     # Fallback to nature cam with ranking refresh
     logger.warning("RTSP missing or failed; switching to fallback nature cam")
-    return _fallback_loop()
+    rc = _fallback_loop()
+    logger.info(f"CamPlayer shutting down (exit code {rc})")
+    return rc
 
 
 def _load_motion_config() -> Optional[dict]:

@@ -33,17 +33,30 @@ templates = Jinja2Templates(directory=str(BASE / "app" / "templates"))
 def _startup():
     RUNTIME.mkdir(parents=True, exist_ok=True)
     SNAPS.mkdir(parents=True, exist_ok=True)
-    if not DISCOVERED.exists():
-        DISCOVERED.write_text(json.dumps({"last_scan": None, "cameras": []}, indent=2))
-    write_overlay(False)
+    # Register file sinks FIRST so all subsequent messages are captured in the log.
     logger.add(str(BASE / "logs" / "camstack.log"), rotation="10 MB")
     logger.add(
         str(BASE / "logs" / "nature_feed.log"),
         rotation="10 MB",
-        filter=lambda r: "[NatureGrabber] Selected stream:" in r["message"]
-                         or "[NatureGrabber] Stream opened:" in r["message"],
+        filter=lambda r: any(tag in r["message"] for tag in (
+            "[NatureGrabber] Selected stream:",
+            "[NatureGrabber] Stream opened:",
+            "[NatureGrabber] Feed started",
+            "[NatureGrabber] Feed stop",
+        )),
         format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
     )
+    logger.info(f"CamStack v{VERSION} starting up")
+    if not DISCOVERED.exists():
+        DISCOVERED.write_text(json.dumps({"last_scan": None, "cameras": []}, indent=2))
+    write_overlay(False)
+    logger.info("CamStack startup complete")
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    logger.info("CamStack shutting down")
+    _stream_manager.stop_all()
 
 
 def _now_iso() -> str:
@@ -666,12 +679,17 @@ class _MjpegStreamManager:
             if camera_id not in self._grabbers:
                 rtsp_url = self._resolve_rtsp(camera_id)
                 if not rtsp_url:
+                    logger.warning(f"[MJPEG] Camera not found in config: {camera_id}")
                     return None
+                logger.info(f"[MJPEG] New stream requested for camera {camera_id}")
                 self._grabbers[camera_id] = _CamGrabber(camera_id, rtsp_url)
             return self._grabbers[camera_id]
 
     def stop_all(self) -> None:
         with self._lock:
+            count = len(self._grabbers)
+            if count:
+                logger.info(f"[MJPEG] Stopping {count} active stream grabber(s)")
             for g in self._grabbers.values():
                 g.stop()
             self._grabbers.clear()
