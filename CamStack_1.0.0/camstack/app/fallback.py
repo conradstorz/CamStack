@@ -101,7 +101,7 @@ _EXCLUDE_TITLE_RE = re.compile(
     r'theme.?park|amusement|boardwalk|wildwood|casino|'
     r'traffic.?cam|road.?cam|weather.?cam|security.?cam|dashboard.?cam|dashcam|'
     r'sports|concert|festival|parade|'
-    r'city.?cam|airport|mall|hotel|resort|bar.?cam|pub'
+    r'city.?cam|airport|mall|hotel|resort|bar.?cam|pub|memorial'
     r')',
     re.IGNORECASE,
 )

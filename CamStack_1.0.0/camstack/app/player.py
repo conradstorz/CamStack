@@ -367,7 +367,7 @@ _NATURE_REJECT: frozenset[str] = frozenset({
     "gaming", "game", "minecraft", "fortnite", "twitch", "esport",
     "movie", "film", "trailer", "comedy", "funny", "meme",
     "news", "politics", "sports", "football", "basketball",
-    "jellyfish", "monterey",
+    "jellyfish", "monterey", "memorial",
 })
 
 
