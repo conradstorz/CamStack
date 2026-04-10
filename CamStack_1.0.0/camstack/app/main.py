@@ -14,6 +14,7 @@ from .discovery import onvif_discover
 from .overlay_gen import write_overlay, get_first_ipv4
 from .motion_memory import MotionMemory, format_motion_age
 from . import identify_streams
+from . import webcam_curator
 
 BASE = Path("/opt/camstack")
 RUNTIME = BASE / "runtime"
@@ -28,6 +29,7 @@ app.mount("/snaps", StaticFiles(directory=str(SNAPS)), name="snaps")
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/clips", StaticFiles(directory=str(CLIPS_DIR)), name="clips")
 templates = Jinja2Templates(directory=str(BASE / "app" / "templates"))
+app.include_router(webcam_curator.router)
 
 @app.on_event("startup")
 def _startup():
@@ -50,6 +52,7 @@ def _startup():
     if not DISCOVERED.exists():
         DISCOVERED.write_text(json.dumps({"last_scan": None, "cameras": []}, indent=2))
     write_overlay(False)
+    webcam_curator.curator_startup()
     logger.info("CamStack startup complete")
 
 
