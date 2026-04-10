@@ -261,228 +261,182 @@ def discover_seeds() -> list[dict]:
 
 # ── Discovery: Windy.com ─────────────────────────────────────────────────────
 
-def discover_windy(api_key: str, limit: int = 50) -> list[dict]:
+def discover_windy(api_key: str, limit: int = 200) -> list[dict]:
     """
-    Windy.com Webcam API v3 — thousands of real outdoor webcams worldwide.
-    Free API key: https://api.windy.com/
+    Windy.com Webcam API v3 is NOT usable as a video stream source.
+
+    Investigation found that Windy's webcams are time-lapse image archives
+    (JPEG stills stored at imgproxy.windy.com), not live video streams.
+    Their embed player URLs are HTML pages with no extractable m3u8/RTSP URL.
+    yt-dlp returns "Unsupported URL" for all Windy embed pages.
+
+    The API key is retained in config.json for potential future use if Windy
+    adds a live-stream API, but discovery is disabled to avoid polluting the
+    database with feeds that will always fail at play-time.
     """
-    if not api_key:
-        logger.debug("[Curator] Windy API key not configured — skipping")
-        return []
-
-    results: list[dict] = []
-    seen: set[str] = set()
-    categories = ["nature", "animals", "mountains", "seas", "coast", "lakes", "rivers"]
-    headers = {"x-windy-api-key": api_key}
-
-    for cat in categories:
-        try:
-            resp = requests.get(
-                "https://api.windy.com/webcams/api/v3/webcams",
-                params={"limit": limit, "offset": 0, "category": cat,
-                        "include": "player,location", "lang": "en"},
-                headers=headers,
-                timeout=15,
-            )
-            if resp.status_code != 200:
-                logger.warning(f"[Curator] Windy API {cat!r}: HTTP {resp.status_code}")
-                continue
-            for wc in resp.json().get("webcams", []):
-                player = wc.get("player", {})
-                url = (player.get("day", {}).get("embed")
-                       or player.get("live", {}).get("embed"))
-                if not url or url in seen:
-                    continue
-                seen.add(url)
-                loc = wc.get("location", {})
-                results.append({
-                    "url": url,
-                    "title": wc.get("title") or "",
-                    "source": "windy",
-                    "category": cat,
-                    "tags": [cat],
-                    "location": {
-                        "lat": loc.get("latitude"),
-                        "lon": loc.get("longitude"),
-                        "country": loc.get("country"),
-                        "region": loc.get("region"),
-                    },
-                    "thumbnail": wc.get("image", {}).get("current", {}).get("preview") or "",
-                })
-        except Exception as e:
-            logger.warning(f"[Curator] Windy discovery failed for {cat!r}: {e}")
-
-    logger.info(f"[Curator] Windy: found {len(results)} feeds")
-    return results
+    if api_key:
+        logger.debug(
+            "[Curator] Windy API key present but Windy discovery is disabled — "
+            "Windy embeds are time-lapse image archives, not playable streams"
+        )
+    return []
 
 
-# ── Discovery: SkylineWebcams ────────────────────────────────────────────────
+# ── Discovery: extra curated YouTube nature channels ────────────────────────
+#
+# SkylineWebcams is fully JavaScript-rendered and its yt-dlp extractor is
+# marked CURRENTLY BROKEN.  EarthCam's category URLs (/nature/, /animals/, …)
+# are HTTP 404 as of 2026-04 and that site is also JS-rendered with no
+# accessible extractor.  Rather than scrape unusable pages, this block adds
+# more verified YouTube nature / wildlife / aquarium channels that supplement
+# the core seeds.
+
+_EXTRA_SEEDS: list[dict] = [
+    # ── Aquariums ────────────────────────────────────────────────────────────
+    {"url": "https://www.youtube.com/@MontereyBayAquarium/live",
+     "title": "Monterey Bay Aquarium",          "source": "aquarium",  "category": "marine",
+     "tags": ["ocean", "fish", "kelp", "jellyfish", "sea-otter"]},
+    {"url": "https://www.youtube.com/@GeorgiaAquarium/live",
+     "title": "Georgia Aquarium",               "source": "aquarium",  "category": "marine",
+     "tags": ["ocean", "whale-shark", "beluga"]},
+    {"url": "https://www.youtube.com/@NewEnglandAquarium/live",
+     "title": "New England Aquarium",           "source": "aquarium",  "category": "marine",
+     "tags": ["ocean", "penguin"]},
+    {"url": "https://www.youtube.com/@SheddAquarium/live",
+     "title": "Shedd Aquarium",                 "source": "aquarium",  "category": "marine",
+     "tags": ["ocean", "beluga", "dolphins"]},
+    {"url": "https://www.youtube.com/@OregonCoastAquarium/live",
+     "title": "Oregon Coast Aquarium",          "source": "aquarium",  "category": "marine",
+     "tags": ["ocean", "otters", "sharks"]},
+    {"url": "https://www.youtube.com/@VancouverAquarium/live",
+     "title": "Vancouver Aquarium",             "source": "aquarium",  "category": "marine",
+     "tags": ["ocean", "beluga", "pacific"]},
+
+    # ── Eagle / raptor cams ──────────────────────────────────────────────────
+    {"url": "https://www.youtube.com/@AmericanEagleFoundation/live",
+     "title": "American Eagle Foundation",      "source": "eaglecam",  "category": "birds",
+     "tags": ["eagle", "nest", "birds"]},
+    {"url": "https://www.youtube.com/@BigBearEagleNestCam/live",
+     "title": "Big Bear Bald Eagle Nest Cam",   "source": "eaglecam",  "category": "birds",
+     "tags": ["eagle", "nest", "california", "birds"]},
+    {"url": "https://www.youtube.com/@DcEagleCam/live",
+     "title": "DC Eagle Cam",                   "source": "eaglecam",  "category": "birds",
+     "tags": ["eagle", "nest", "birds"]},
+    {"url": "https://www.youtube.com/@AbsoluteBirds/live",
+     "title": "Absolute Birds",                 "source": "birdcam",   "category": "birds",
+     "tags": ["birds", "feeder", "garden"]},
+
+    # ── More wildlife / nature ───────────────────────────────────────────────
+    {"url": "https://www.youtube.com/@MBARI_News/live",
+     "title": "MBARI Deep-Sea Exploration",     "source": "research",  "category": "marine",
+     "tags": ["deep-sea", "ocean", "research"]},
+    {"url": "https://www.youtube.com/@NatureCanada/live",
+     "title": "Nature Canada",                  "source": "wildlife",  "category": "wildlife",
+     "tags": ["canada", "wildlife", "birds"]},
+    {"url": "https://www.youtube.com/@SanDiegoZooSafariPark/live",
+     "title": "San Diego Zoo Safari Park",      "source": "zoo",       "category": "wildlife",
+     "tags": ["zoo", "safari", "africa"]},
+    {"url": "https://www.youtube.com/@ColumbusZoo/live",
+     "title": "Columbus Zoo",                   "source": "zoo",       "category": "wildlife",
+     "tags": ["zoo", "animals"]},
+    {"url": "https://www.youtube.com/@TorontoZoo/live",
+     "title": "Toronto Zoo",                    "source": "zoo",       "category": "wildlife",
+     "tags": ["canada", "zoo"]},
+    {"url": "https://www.youtube.com/@AbsoluteNature4K/live",
+     "title": "Absolute Nature 4K",             "source": "youtube",   "category": "landscape",
+     "tags": ["4k", "landscape", "forest"]},
+    {"url": "https://www.youtube.com/@ChesterZoo/live",
+     "title": "Chester Zoo",                    "source": "zoo",       "category": "wildlife",
+     "tags": ["zoo", "uk", "animals"]},
+
+    # ── Landscape / scenic ───────────────────────────────────────────────────
+    {"url": "https://www.youtube.com/@GlacierNPS/live",
+     "title": "Glacier National Park",          "source": "nps",       "category": "landscape",
+     "tags": ["national-park", "mountains", "glaciers"]},
+    {"url": "https://www.youtube.com/@GreatSmokyMountainsNPS/live",
+     "title": "Great Smoky Mountains NPS",      "source": "nps",       "category": "landscape",
+     "tags": ["national-park", "mountains", "appalachian"]},
+    {"url": "https://www.youtube.com/@GrandCanyonNPS/live",
+     "title": "Grand Canyon National Park",     "source": "nps",       "category": "landscape",
+     "tags": ["national-park", "canyon", "desert"]},
+]
+
 
 def discover_skylinewebcams(max_per_section: int = 30) -> list[dict]:
     """
-    Scrape SkylineWebcams nature, wildlife, marine, and mountain sections.
-    Returns embed page URLs — the player resolves these at stream time.
+    SkylineWebcams is fully JavaScript-rendered; its yt-dlp extractor is
+    marked CURRENTLY BROKEN.  This function now returns the additional curated
+    YouTube nature channel seeds defined in _EXTRA_SEEDS instead.
     """
-    sections = [
-        ("https://www.skylinewebcams.com/en/webcam/natura.html",   "nature"),
-        ("https://www.skylinewebcams.com/en/webcam/animali.html",   "wildlife"),
-        ("https://www.skylinewebcams.com/en/webcam/mare.html",      "marine"),
-        ("https://www.skylinewebcams.com/en/webcam/montagna.html",  "landscape"),
-    ]
-    results: list[dict] = []
-    seen: set[str] = set()
-    headers = {"User-Agent": "CamStack/2.0 webcam-curator (open source)"}
-
-    for page_url, category in sections:
-        try:
-            resp = requests.get(page_url, headers=headers, timeout=12)
-            if resp.status_code != 200:
-                logger.warning(f"[Curator] SkylineWebcams {page_url}: HTTP {resp.status_code}")
-                continue
-
-            # Extract embedded cam IDs from anchor hrefs
-            cam_ids = re.findall(
-                r'href="https://www\.skylinewebcams\.com/[a-z]+/webcam/[^"]+/([^/"]+)\.html"',
-                resp.text,
-            )
-            # Also catch data-id attributes
-            cam_ids += re.findall(r'data-id=["\'](\d+)["\']', resp.text)
-            cam_ids = list(dict.fromkeys(cam_ids))[:max_per_section]
-
-            # Grab page titles from heading tags near cam links
-            raw_titles = re.findall(
-                r'<(?:h[1-4]|span)[^>]*class="[^"]*(?:title|name)[^"]*"[^>]*>([^<]{3,80})</',
-                resp.text,
-            )
-            titles = [t.strip() for t in raw_titles]
-
-            for i, cid in enumerate(cam_ids):
-                url = f"https://embed.skylinewebcams.com/cam/{cid}.html"
-                if url in seen:
-                    continue
-                seen.add(url)
-                results.append({
-                    "url": url,
-                    "title": titles[i] if i < len(titles) else f"SkylineWebcam {cid}",
-                    "source": "skylinewebcams",
-                    "category": category,
-                    "tags": [category],
-                })
-        except Exception as e:
-            logger.warning(f"[Curator] SkylineWebcams scrape failed for {page_url}: {e}")
-
-    logger.info(f"[Curator] SkylineWebcams: found {len(results)} feeds")
-    return results
+    logger.debug("[Curator] SkylineWebcams scraper replaced by extra YouTube seeds")
+    return list(_EXTRA_SEEDS)
 
 
 # ── Discovery: EarthCam ──────────────────────────────────────────────────────
 
 def discover_earthcam() -> list[dict]:
     """
-    Scrape EarthCam's nature, animals, and national park sections.
-    Extracts YouTube embeds and direct cam page URLs.
+    EarthCam's nature/animals/parks section URLs (/nature/, /animals/, etc.) all
+    return HTTP 404 as of 2026-04.  Their site is fully JavaScript-rendered and
+    has no accessible yt-dlp extractor.  Discovery is disabled.
     """
-    sections = [
-        ("https://www.earthcam.com/nature/",     "nature"),
-        ("https://www.earthcam.com/animals/",    "wildlife"),
-        ("https://www.earthcam.com/usa/parks/",  "landscape"),
-    ]
-    results: list[dict] = []
-    seen: set[str] = set()
-    headers = {"User-Agent": "CamStack/2.0 webcam-curator (open source)"}
-
-    for page_url, category in sections:
-        try:
-            resp = requests.get(page_url, headers=headers, timeout=12)
-            if resp.status_code != 200:
-                logger.warning(f"[Curator] EarthCam {page_url}: HTTP {resp.status_code}")
-                continue
-
-            # Direct cam pages
-            for path in re.findall(r'href="(https://www\.earthcam\.com/cams/[^"]+)"', resp.text)[:20]:
-                if path not in seen:
-                    seen.add(path)
-                    results.append({"url": path, "title": "", "source": "earthcam", "category": category})
-
-            # YouTube video embeds
-            title_tags = re.findall(
-                r'<(?:h\d|div)[^>]*class="[^"]*(?:title|cam.?name)[^"]*"[^>]*>([^<]{3,80})</',
-                resp.text,
-            )
-            titles = [t.strip() for t in title_tags]
-            for i, vid in enumerate(re.findall(r'youtube\.com/embed/([A-Za-z0-9_-]{11})', resp.text)[:20]):
-                url = f"https://www.youtube.com/watch?v={vid}"
-                if url not in seen:
-                    seen.add(url)
-                    results.append({
-                        "url": url,
-                        "title": titles[i] if i < len(titles) else "",
-                        "source": "earthcam",
-                        "category": category,
-                    })
-        except Exception as e:
-            logger.warning(f"[Curator] EarthCam scrape failed for {page_url}: {e}")
-
-    logger.info(f"[Curator] EarthCam: found {len(results)} feeds")
-    return results
+    logger.debug("[Curator] EarthCam discovery disabled — section URLs are 404 and site is JS-rendered")
+    return []
 
 
 # ── Discovery: NPS ───────────────────────────────────────────────────────────
 
 def discover_nps(api_key: str = "") -> list[dict]:
     """
-    US National Park Service webcams.
+    US National Park Service webcams via the NPS Data API.
     Free API key: https://www.nps.gov/subjects/developer/
-    Falls back to scraping the NPS webcams HTML page when no key is provided.
+
+    Note: the NPS API returns webcam *viewer page* URLs
+    (https://www.nps.gov/media/webcam/view.htm?id=…), not direct video streams.
+    Those viewer pages are JavaScript-rendered so yt-dlp cannot extract streams
+    from them.  This function therefore only returns feeds that have
+    isStreaming=true AND whose URL yt-dlp could reasonably handle (e.g. a
+    YouTube embed that happened to be inlined).  In practice this yields 0
+    results until the NPS exposes direct stream URLs in their API.
+
+    The HTML fallback (scraping nps-webcams.htm) was removed after confirming
+    the page contains no YouTube embeds.
     """
+    if not api_key:
+        logger.debug("[Curator] NPS API key not set — skipping NPS discovery")
+        return []
+
     results: list[dict] = []
     headers = {"User-Agent": "CamStack/2.0 webcam-curator (open source)"}
 
-    if api_key:
-        try:
-            resp = requests.get(
-                "https://developer.nps.gov/api/v1/webcams",
-                params={"api_key": api_key, "limit": 200},
-                headers=headers,
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                for cam in resp.json().get("data", []):
-                    url = cam.get("url") or cam.get("streamUrl") or cam.get("embedUrl")
-                    if url:
-                        results.append({
-                            "url": url,
-                            "title": cam.get("title") or cam.get("name") or "",
-                            "source": "nps",
-                            "category": "landscape",
-                            "tags": ["national-park"],
-                            "location": {"country": "US", "region": cam.get("parkCode", "")},
-                        })
-                logger.info(f"[Curator] NPS API: found {len(results)} feeds")
-                return results
-            logger.warning(f"[Curator] NPS API: HTTP {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"[Curator] NPS API failed: {e}")
-
-    # Fallback: scrape the public webcams page for YouTube embeds
     try:
         resp = requests.get(
-            "https://www.nps.gov/subjects/digital/nps-webcams.htm",
-            headers=headers, timeout=15,
+            "https://developer.nps.gov/api/v1/webcams",
+            params={"api_key": api_key, "limit": 200},
+            headers=headers,
+            timeout=15,
         )
-        if resp.status_code == 200:
-            yt_ids = re.findall(r'youtube\.com/embed/([A-Za-z0-9_-]{11})', resp.text)
-            yt_ids += re.findall(r'youtu\.be/([A-Za-z0-9_-]{11})', resp.text)
-            for vid in dict.fromkeys(yt_ids):
-                results.append({
-                    "url": f"https://www.youtube.com/watch?v={vid}",
-                    "title": "",
-                    "source": "nps",
-                    "category": "landscape",
-                    "tags": ["national-park"],
-                })
+        if resp.status_code != 200:
+            logger.warning(f"[Curator] NPS API: HTTP {resp.status_code}")
+            return []
+        for cam in resp.json().get("data", []):
+            if not cam.get("isStreaming"):
+                continue
+            # Only keep YouTube watch/embed URLs — NPS viewer pages aren't playable
+            url = cam.get("url") or ""
+            yt = re.search(r'(?:youtube\.com/(?:watch\?v=|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})', url)
+            if not yt:
+                continue
+            results.append({
+                "url": f"https://www.youtube.com/watch?v={yt.group(1)}",
+                "title": cam.get("title") or "",
+                "source": "nps",
+                "category": "landscape",
+                "tags": ["national-park"],
+                "location": {"country": "US"},
+            })
     except Exception as e:
-        logger.warning(f"[Curator] NPS scrape failed: {e}")
+        logger.warning(f"[Curator] NPS API failed: {e}")
 
     logger.info(f"[Curator] NPS: found {len(results)} feeds")
     return results
@@ -492,47 +446,22 @@ def discover_nps(api_key: str = "") -> list[dict]:
 
 def discover_alertwildfire() -> list[dict]:
     """
-    AlertCalifornia fire-watch cameras — remote mountain, ridge, and wilderness views.
-    These are real fixed cameras with spectacular landscape imagery.
+    AlertCalifornia fire-watch cameras serve JPEG snapshot images, not video streams.
+
+    Their public camera list moved to:
+      https://cameras.alertcalifornia.org/public-camera-data/all_cameras-v3.json
+    (GeoJSON FeatureCollection, 2000+ cameras).
+
+    Each camera exposes still frames at:
+      https://cameras.alertcalifornia.org/public-camera-data/{id}/latest-3.jpg
+
+    cv2.VideoCapture and yt-dlp cannot play these JPEG-snapshot feeds.  Discovery
+    is disabled until the player gains MJPEG/snapshot support.
     """
-    results: list[dict] = []
-    headers = {"User-Agent": "CamStack/2.0 webcam-curator (open source)"}
-
-    # AlertCalifornia publishes a CORS-accessible JSON camera list
-    try:
-        resp = requests.get(
-            "https://cameras.alertcalifornia.org/public-cameras.json",
-            headers=headers, timeout=15,
-        )
-        if resp.status_code == 200:
-            for cam in resp.json():
-                streams = cam.get("streams") or []
-                url = next((s["url"] for s in streams if s.get("url")), None)
-                if not url:
-                    url = cam.get("url") or cam.get("streamUrl")
-                if not url:
-                    continue
-                loc = cam.get("location") or {}
-                results.append({
-                    "url": url,
-                    "title": cam.get("name") or cam.get("id") or "",
-                    "source": "alertwildfire",
-                    "category": "landscape",
-                    "tags": ["wilderness", "mountains", "fire-watch", "california"],
-                    "location": {
-                        "lat": loc.get("latitude") or loc.get("lat"),
-                        "lon": loc.get("longitude") or loc.get("lon"),
-                        "country": "US",
-                        "region": "California",
-                    },
-                })
-        else:
-            logger.warning(f"[Curator] AlertCalifornia: HTTP {resp.status_code}")
-    except Exception as e:
-        logger.warning(f"[Curator] AlertCalifornia failed: {e}")
-
-    logger.info(f"[Curator] AlertWildfire: found {len(results)} feeds")
-    return results
+    logger.debug(
+        "[Curator] AlertCalifornia discovery disabled — cameras serve JPEG snapshots, not video streams"
+    )
+    return []
 
 
 # ── Master discovery runner ──────────────────────────────────────────────────
