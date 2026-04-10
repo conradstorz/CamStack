@@ -42,7 +42,8 @@ EXPLORE_LIVE_URLS = [
     "https://www.youtube.com/@NOAAOceanExplorer/live",
 
     # ── Misc reliable 24/7 nature ──
-    "https://www.youtube.com/@EarthCam/live",
+    # @EarthCam/live removed — their YouTube channel rotates through all cam types
+    # (memorials, city cams, airports) with no nature filter.
     "https://www.youtube.com/@NatureRelaxation/live",
 ]
 

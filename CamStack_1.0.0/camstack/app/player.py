@@ -339,27 +339,6 @@ def _show_default_still(display: StillFrameDisplay) -> bool:
     return False
 
 
-def _resolve_ytdlp_url(youtube_url: str) -> Optional[str]:
-    """Resolve a YouTube URL to a direct streamable URL via yt-dlp."""
-    try:
-        result = subprocess.run(
-            [
-                "yt-dlp",
-                "--format", "best[height<=1080]/best",
-                "--extractor-args", "youtube:player_client=android",
-                "--no-playlist",
-                "-g", youtube_url,
-            ],
-            capture_output=True, text=True, timeout=45,
-        )
-        if result.returncode == 0:
-            url = result.stdout.strip().split("\n")[0]
-            return url or None
-    except Exception as e:
-        logger.warning(f"[yt-dlp] URL resolution failed: {e}")
-    return None
-
-
 # Words that disqualify a stream from being used as the ambient nature feed.
 _NATURE_REJECT: frozenset[str] = frozenset({
     "music", "song", "opera", "concert", "album", "band", "singer",
@@ -569,19 +548,21 @@ def _spawn_player(url: str) -> tuple[list[subprocess.Popen], subprocess.Popen, l
     if _is_youtube_url(url):
         # Resolve to a direct streamable URL first so mpv doesn't time out
         # probing an empty stdin pipe while yt-dlp's internal ffmpeg starts up.
-        direct_url = _resolve_ytdlp_url(url)
-        if direct_url:
-            logger.info(f"[Player] Resolved {url[:60]}... -> direct stream")
+        resolved = _resolve_ytdlp_with_title(url)
+        if resolved:
+            direct_url, title = resolved
+            logger.info(f"[Player] Now playing: {title!r} (from {url[:60]})")
             mpv_proc = subprocess.Popen(
                 _build_mpv_cmd(direct_url, use_ytdl=False),
                 stderr=subprocess.DEVNULL,
             )
             return [mpv_proc], mpv_proc, []
         # Resolution failed — let mpv use its own ytdl-hook as a fallback.
-        logger.warning("[Player] Direct URL resolution failed; trying mpv ytdl-hook")
+        logger.warning(f"[Player] Direct URL resolution failed for {url[:60]}; trying mpv ytdl-hook")
         mpv_proc = subprocess.Popen(_build_mpv_cmd(url, use_ytdl=True), stderr=subprocess.DEVNULL)
         return [mpv_proc], mpv_proc, []
     # Non-YouTube URL (e.g. RTSP): no ytdl options needed.
+    logger.info(f"[Player] Now playing: {url[:80]}")
     mpv_proc = subprocess.Popen(_build_mpv_cmd(url, use_ytdl=False), stderr=subprocess.DEVNULL)
     return [mpv_proc], mpv_proc, []
 
@@ -641,8 +622,10 @@ def _fallback_loop(recover_urls: list[str] | None = None) -> int:
     if current is None:
         current = LiveStreamInfo(url=get_featured_fallback_url(exclude=blocked), title=None, viewers=0)
 
-    logger.warning(
-        f"Fallback stream selected: {current.url} (viewers={current.viewers})"
+    logger.info(
+        f"[Fallback] Starting stream: {current.url}"
+        + (f" title={current.title!r}" if current.title else "")
+        + f" (viewers={current.viewers})"
     )
     procs, primary, files = _spawn_player(current.url)
     last_check = time.monotonic()
@@ -654,9 +637,10 @@ def _fallback_loop(recover_urls: list[str] | None = None) -> int:
         logger.warning(f"Ranking failed: {e}")
         best = None
     if best and best.viewers > current.viewers and best.url != current.url:
-        logger.warning(
-            "Switching fallback stream: "
-            f"{current.viewers} -> {best.viewers} viewers"
+        logger.info(
+            f"[Fallback] Switching to higher-ranked stream: "
+            f"{best.url}" + (f" ({best.title!r})" if best.title else "")
+            + f" — {current.viewers} -> {best.viewers} viewers"
         )
         _terminate_procs(procs)
         _close_files(files)
@@ -670,7 +654,11 @@ def _fallback_loop(recover_urls: list[str] | None = None) -> int:
         try:
             if primary.poll() is not None:
                 blocked.add(current.url)
-                logger.warning("Fallback stream failed; selecting a new candidate")
+                logger.warning(
+                    f"[Fallback] Stream ended/crashed: {current.url}"
+                    + (f" ({current.title!r})" if current.title else "")
+                    + " — selecting a new candidate"
+                )
                 time.sleep(3)  # brief backoff to prevent rapid crash loops
                 try:
                     best = get_best_live_stream(exclude=blocked)
@@ -685,6 +673,10 @@ def _fallback_loop(recover_urls: list[str] | None = None) -> int:
                 else:
                     current = best
                     save_cached_stream(best)
+                logger.info(
+                    f"[Fallback] Next stream: {current.url}"
+                    + (f" ({current.title!r})" if current.title else "")
+                )
                 write_overlay(True)
                 _terminate_procs(procs)
                 _close_files(files)
@@ -704,9 +696,10 @@ def _fallback_loop(recover_urls: list[str] | None = None) -> int:
                 logger.warning(f"Ranking failed: {e}")
                 best = None
             if best and best.viewers > current.viewers and best.url != current.url:
-                logger.warning(
-                    "Switching fallback stream: "
-                    f"{current.viewers} -> {best.viewers} viewers"
+                logger.info(
+                    f"[Fallback] Switching to higher-ranked stream: {best.url}"
+                    + (f" ({best.title!r})" if best.title else "")
+                    + f" — {current.viewers} -> {best.viewers} viewers"
                 )
                 _terminate_procs(procs)
                 _close_files(files)
