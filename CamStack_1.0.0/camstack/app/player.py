@@ -16,6 +16,7 @@ from .fallback import (
     load_cached_stream,
     save_cached_stream,
     EXPLORE_LIVE_URLS,
+    SPORTS_TITLE_RE,
 )
 from .motion_detector import MotionDetector
 from .motion_memory import MotionMemory, DEFAULT_CLIP_DURATION
@@ -448,15 +449,26 @@ class NatureGrabber:
             if direct_url is None or (now - last_resolve) >= self._REFRESH_INTERVAL:
                 import random as _random
                 resolved_url: Optional[str] = None
+                # Load per-stream blocklist from config.
+                _blocked: set[str] = set()
+                try:
+                    _blocked = set(json.loads(CFG.read_text()).get("blocked_streams", []))
+                except Exception:
+                    pass
                 # Shuffle the candidate pool and try each until one passes
                 # content validation (title must not match _NATURE_REJECT).
                 pool = list(EXPLORE_LIVE_URLS) + get_reddit_nature_cams()
                 _random.shuffle(pool)
                 for candidate in pool:
+                    if candidate in _blocked:
+                        continue
                     result = _resolve_ytdlp_with_title(candidate)
                     if result is None:
                         continue
                     url_candidate, title_candidate = result
+                    if title_candidate and SPORTS_TITLE_RE.search(title_candidate):
+                        logger.info(f"[NatureGrabber] Skipping sports content: {title_candidate!r}")
+                        continue
                     resolved_url = url_candidate
                     logger.info(f"[NatureGrabber] Selected stream: {title_candidate!r}")
                     break

@@ -102,10 +102,22 @@ _EXCLUDE_TITLE_RE = re.compile(
     r'theme.?park|amusement|boardwalk|wildwood|casino|'
     r'traffic.?cam|road.?cam|weather.?cam|security.?cam|dashboard.?cam|dashcam|'
     r'sports|concert|festival|parade|'
-    r'city.?cam|airport|mall|hotel|resort|bar.?cam|pub|memorial'
+    r'city.?cam|airport|mall|hotel|resort|bar.?cam|pub|memorial|'
+    # Sports leagues, events and generic terms
+    r'nfl|nba|nhl|mlb|nascar|mls|ufc|wwe|'
+    r'football|soccer|basketball|baseball|hockey|tennis|golf|cricket|rugby|'
+    r'superbowl|super.?bowl|world.?series|stanley.?cup|march.?madness|'
+    r'playoffs?|championship|tournament|match.?day|game.?day|'
+    r'redskins|eagles|cowboys|patriots|chiefs|packers|'
+    r'lakers|celtics|warriors|knicks|bulls|'
+    r'yankees|dodgers|red.?sox|cubs|braves|'
+    r'draft|highlight|recap|halftime|overtime|scoreboard|standings'
     r')',
     re.IGNORECASE,
 )
+
+# Reject sports content in NatureGrabber title checks (also used in player.py)
+SPORTS_TITLE_RE = _EXCLUDE_TITLE_RE
 
 
 def get_reddit_nature_cams(use_cache: bool = True, max_age: int = 7200) -> list[str]:
