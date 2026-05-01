@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# uv
+uv.lock
+
+# Logs
+logs/
+*.log
+
+# Runtime state (generated at runtime)
+runtime/clips/
+runtime/snaps/
+runtime/discovered_cameras.json
+runtime/identify_report.json
+runtime/motion_memory.json
+runtime/reddit_cams.json
+runtime/overlay.ass
+runtime/webcams.db
+runtime/default.jpg
+runtime/mpv-debug.log
+runtime/ytdlp.log
+
+# TLS certificates and keys (sensitive)
+certs/server.crt
+certs/server.key
+ca/
+
+# Node.js
+todo-app/node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
