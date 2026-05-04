@@ -16,7 +16,13 @@ dependencies = [
   "numpy",
   "pillow",
   "opencv-python-headless",
+  "httpx",
+  "yt-dlp",
+  "rich",
 ]
+
+[project.scripts]
+webcam-catalog = "app.webcam_catalog_tool:main"
 
 [tool.uv]
 index-url = "https://pypi.org/simple"

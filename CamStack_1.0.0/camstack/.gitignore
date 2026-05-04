@@ -33,6 +33,10 @@ runtime/webcams.db
 runtime/default.jpg
 runtime/mpv-debug.log
 runtime/ytdlp.log
+runtime/webcam_catalog.json
+runtime/catalog_thumbnails/
+runtime/catalog_reports/
+runtime/catalog_discovery/
 
 # TLS certificates and keys (sensitive)
 certs/server.crt

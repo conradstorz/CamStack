@@ -464,6 +464,73 @@ def discover_alertwildfire() -> list[dict]:
     return []
 
 
+# ── Discovery: webcam_catalog_tool.py JSON catalog ───────────────────────────
+
+_CATALOG_PATH = BASE / "runtime" / "webcam_catalog.json"
+
+_CATALOG_CATEGORY_MAP: dict[str, str] = {
+    "nature": "wildlife",
+    "wildlife": "wildlife",
+    "city": "landscape",
+    "construction": "landscape",
+    "traffic": "landscape",
+    "industrial": "landscape",
+    "weather": "landscape",
+    "youtube": "wildlife",
+    "other": "wildlife",
+}
+
+
+def discover_catalog() -> list[dict]:
+    """
+    Import feeds from the webcam_catalog_tool JSON catalog into the curator DB.
+
+    Only feeds that have a usable URL (page_url or stream_url) and whose
+    status is not 'offline' are included.  This is a read-only operation —
+    the catalog file is never modified.
+    """
+    if not _CATALOG_PATH.exists():
+        logger.debug("[Curator] webcam_catalog not found — skipping catalog import")
+        return []
+
+    try:
+        raw = json.loads(_CATALOG_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(f"[Curator] Failed to read webcam_catalog: {exc}")
+        return []
+
+    feeds_raw = raw.get("feeds", [])
+    results: list[dict] = []
+
+    for entry in feeds_raw:
+        if entry.get("status") == "offline":
+            continue
+
+        url = entry.get("page_url") or entry.get("stream_url")
+        if not url:
+            continue
+
+        category = _CATALOG_CATEGORY_MAP.get(entry.get("category", "other"), "wildlife")
+        tags = entry.get("tags") or []
+
+        results.append({
+            "url": url,
+            "title": entry.get("name") or "",
+            "source": entry.get("source") or "webcam-catalog",
+            "category": category,
+            "tags": tags,
+            "thumbnail": entry.get("thumbnail_url") or "",
+            "location": {
+                k: entry[k]
+                for k in ("country", "region", "city")
+                if entry.get(k)
+            },
+        })
+
+    logger.info(f"[Curator] webcam_catalog: imported {len(results)} feeds from catalog")
+    return results
+
+
 # ── Master discovery runner ──────────────────────────────────────────────────
 
 def run_discovery() -> dict:
@@ -478,6 +545,7 @@ def run_discovery() -> dict:
     found += discover_earthcam()
     found += discover_nps(cfg.get("nps_api_key", ""))
     found += discover_alertwildfire()
+    found += discover_catalog()
 
     inserted = 0
     blocked_count = 0
@@ -827,6 +895,28 @@ def api_discover(background_tasks: BackgroundTasks):
     """
     background_tasks.add_task(_run_discovery_task)
     return JSONResponse({"ok": True, "message": "Discovery run started in background"})
+
+
+@router.post("/catalog/import")
+def api_catalog_import():
+    """
+    Import feeds from the webcam_catalog_tool JSON catalog into the curator DB.
+
+    Run this after using the webcam-catalog CLI to add new entries so they
+    become available for recommendation without waiting for the next
+    scheduled discovery run.
+    """
+    feeds = discover_catalog()
+    inserted = 0
+    with _get_db() as conn:
+        blocked_words = _get_blocklist_words(conn)
+        for feed in feeds:
+            if _title_blocked(feed.get("title", ""), blocked_words):
+                continue
+            if _upsert_feed(conn, feed):
+                inserted += 1
+    logger.info(f"[Curator] catalog/import: {inserted} new feeds inserted from {len(feeds)} catalog entries")
+    return JSONResponse({"ok": True, "inserted": inserted, "total_catalog_entries": len(feeds)})
 
 
 def _run_discovery_task() -> None:
