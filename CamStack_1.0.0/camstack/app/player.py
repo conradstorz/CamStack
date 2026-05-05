@@ -414,6 +414,7 @@ class NatureGrabber:
         self._frame: Optional[np.ndarray] = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._last_channel: Optional[str] = None  # de-prioritise on next refresh
 
     def start(self) -> None:
         self._stop_event.clear()
@@ -457,8 +458,13 @@ class NatureGrabber:
                     pass
                 # Shuffle the candidate pool and try each until one passes
                 # content validation (title must not match _NATURE_REJECT).
+                # Move the previously-played channel to the end so we always
+                # try other channels first before falling back to the same one.
                 pool = list(EXPLORE_LIVE_URLS) + get_reddit_nature_cams()
                 _random.shuffle(pool)
+                if self._last_channel and self._last_channel in pool:
+                    pool.remove(self._last_channel)
+                    pool.append(self._last_channel)
                 for candidate in pool:
                     if candidate in _blocked:
                         continue
@@ -470,6 +476,7 @@ class NatureGrabber:
                         logger.info(f"[NatureGrabber] Skipping sports content: {title_candidate!r}")
                         continue
                     resolved_url = url_candidate
+                    self._last_channel = candidate  # remember for next refresh
                     logger.info(f"[NatureGrabber] Selected stream: {title_candidate!r}")
                     break
 
@@ -632,7 +639,15 @@ def _fallback_loop(recover_urls: list[str] | None = None) -> int:
     blocked: set[str] = set()
     current = load_cached_stream()
     if current is None:
-        current = LiveStreamInfo(url=get_featured_fallback_url(exclude=blocked), title=None, viewers=0)
+        try:
+            current = get_best_live_stream(exclude=blocked)
+        except Exception as e:
+            logger.warning(f"[Fallback] Initial stream selection failed: {e}")
+            current = None
+        if current is None:
+            current = LiveStreamInfo(url=get_featured_fallback_url(exclude=blocked), title=None, viewers=0)
+        else:
+            save_cached_stream(current)
 
     logger.info(
         f"[Fallback] Starting stream: {current.url}"
@@ -640,27 +655,6 @@ def _fallback_loop(recover_urls: list[str] | None = None) -> int:
         + f" (viewers={current.viewers})"
     )
     procs, primary, files = _spawn_player(current.url)
-    last_check = time.monotonic()
-
-    # Try to rank and switch soon after startup.
-    try:
-        best = get_best_live_stream(exclude=blocked)
-    except Exception as e:
-        logger.warning(f"Ranking failed: {e}")
-        best = None
-    if best and best.viewers > current.viewers and best.url != current.url:
-        logger.info(
-            f"[Fallback] Switching to higher-ranked stream: "
-            f"{best.url}" + (f" ({best.title!r})" if best.title else "")
-            + f" — {current.viewers} -> {best.viewers} viewers"
-        )
-        _terminate_procs(procs)
-        _close_files(files)
-        current = best
-        write_overlay(True)
-        procs, primary, files = _spawn_player(current.url)
-    if best:
-        save_cached_stream(best)
 
     while True:
         try:
@@ -693,33 +687,11 @@ def _fallback_loop(recover_urls: list[str] | None = None) -> int:
                 _terminate_procs(procs)
                 _close_files(files)
                 procs, primary, files = _spawn_player(current.url)
-                last_check = time.monotonic()
                 continue
         except Exception as e:
             logger.warning(f"Fallback loop error: {e}")
             time.sleep(2)
             continue
-
-        now = time.monotonic()
-        if now - last_check >= 300:
-            try:
-                best = get_best_live_stream(exclude=blocked)
-            except Exception as e:
-                logger.warning(f"Ranking failed: {e}")
-                best = None
-            if best and best.viewers > current.viewers and best.url != current.url:
-                logger.info(
-                    f"[Fallback] Switching to higher-ranked stream: {best.url}"
-                    + (f" ({best.title!r})" if best.title else "")
-                    + f" — {current.viewers} -> {best.viewers} viewers"
-                )
-                _terminate_procs(procs)
-                _close_files(files)
-                current = best
-                write_overlay(True)
-                procs, primary, files = _spawn_player(current.url)
-                save_cached_stream(best)
-            last_check = now
 
         # Camera recovery probe: periodically test if live streams are reachable.
         now = time.monotonic()

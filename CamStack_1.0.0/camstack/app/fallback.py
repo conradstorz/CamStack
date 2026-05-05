@@ -321,18 +321,21 @@ def _viewer_count(data: dict) -> int:
     )
 
 def get_best_live_stream(max_candidates: int = 30, exclude: set[str] | None = None, use_reddit: bool = True) -> LiveStreamInfo | None:
-    """Find the best live nature stream.
+    """Find a live nature stream using weighted-random selection.
 
-    Reddit-discovered URLs (already ranked by community popularity) are prepended
-    so they are tried first; curated EXPLORE_LIVE_URLS act as the safety net.
+    Collects all currently-live streams, then picks one randomly with viewer
+    count used as a soft weight (√viewers+1) — so popular streams are preferred
+    but don't monopolise playback the way a pure viewer-count maximum would.
     """
+    import math
     seed_urls: list[str] = []
     if use_reddit:
         seed_urls = get_reddit_nature_cams()  # pre-filtered & scored
     seed_urls += list(EXPLORE_LIVE_URLS)
+    random.shuffle(seed_urls)  # prevent the same channel being expanded first every time
     candidates = _expand_candidate_urls(seed_urls)
     blocked = exclude or set()
-    best: LiveStreamInfo | None = None
+    live: list[LiveStreamInfo] = []
     for url in candidates[:max_candidates]:
         if url in blocked:
             continue
@@ -340,7 +343,10 @@ def get_best_live_stream(max_candidates: int = 30, exclude: set[str] | None = No
         if not data or not data.get("is_live"):
             continue
         viewers = _viewer_count(data)
-        info = LiveStreamInfo(url=url, title=data.get("title"), viewers=viewers)
-        if best is None or info.viewers > best.viewers:
-            best = info
-    return best
+        live.append(LiveStreamInfo(url=url, title=data.get("title"), viewers=viewers))
+    if not live:
+        return None
+    # Weighted-random pick: √(viewers+1) gives a mild quality bias without
+    # always returning the single most-watched channel (usually BBC Earth).
+    weights = [math.sqrt(max(1, s.viewers + 1)) for s in live]
+    return random.choices(live, weights=weights, k=1)[0]
