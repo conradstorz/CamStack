@@ -351,10 +351,10 @@ _NATURE_REJECT: frozenset[str] = frozenset({
 })
 
 
-def _resolve_ytdlp_with_title(youtube_url: str, timeout: int = 50) -> Optional[tuple[str, str]]:
+def _resolve_ytdlp_with_title(youtube_url: str, timeout: int = 50) -> Optional[tuple[str, str, bool]]:
     """
-    Resolve a YouTube URL to a direct stream URL **and** fetch its title in a
-    single yt-dlp invocation.  Returns ``(direct_url, title)`` or ``None``.
+    Resolve a YouTube URL to a direct stream URL, title, and live flag in a
+    single yt-dlp invocation.  Returns ``(direct_url, title, is_live)`` or ``None``.
     """
     import re as _re
     try:
@@ -391,7 +391,8 @@ def _resolve_ytdlp_with_title(youtube_url: str, timeout: int = 50) -> Optional[t
             candidates = [f for f in fmts if (f.get("height") or 9999) <= 1080] or fmts
             if candidates:
                 url = max(candidates, key=lambda f: f.get("height") or 0).get("url")
-        return (url, title) if url else None
+        is_live: bool = bool(data.get("is_live") or data.get("live_status") == "is_live")
+        return (url, title, is_live) if url else None
     except Exception as exc:
         logger.warning(f"[NatureGrabber] resolve+title failed for {youtube_url}: {exc}")
         return None
@@ -472,22 +473,49 @@ class NatureGrabber:
                 if self._last_channel and self._last_channel in pool:
                     pool.remove(self._last_channel)
                     pool.append(self._last_channel)
+                # Two-pass selection: prefer currently-live streams, fall back
+                # to any working stream (recording / replay) only if nothing
+                # in the pool is live right now.
+                resolved_candidate: Optional[str] = None
+                resolved_title: Optional[str] = None
+                fallback_candidate: Optional[str] = None
+                fallback_title: Optional[str] = None
+                fallback_channel: Optional[str] = None
                 for candidate in pool:
                     if candidate in _blocked:
                         continue
                     result = _resolve_ytdlp_with_title(candidate)
                     if result is None:
                         continue
-                    url_candidate, title_candidate = result
+                    url_candidate, title_candidate, is_live = result
                     if title_candidate and SPORTS_TITLE_RE.search(title_candidate):
                         logger.info(f"[NatureGrabber] Skipping sports content: {title_candidate!r}")
                         continue
-                    resolved_url = url_candidate
-                    self._last_channel = candidate  # remember for next refresh
-                    current_channel = candidate
-                    current_title = title_candidate
-                    logger.info(f"[NatureGrabber] Selected stream: {title_candidate!r}")
-                    break
+                    if is_live:
+                        resolved_candidate = url_candidate
+                        resolved_title = title_candidate
+                        self._last_channel = candidate
+                        current_channel = candidate
+                        current_title = title_candidate
+                        logger.info(f"[NatureGrabber] Selected live stream: {title_candidate!r}")
+                        break
+                    # Keep the first non-live result as a fallback.
+                    if fallback_candidate is None:
+                        fallback_candidate = url_candidate
+                        fallback_title = title_candidate
+                        fallback_channel = candidate
+
+                if resolved_candidate:
+                    resolved_url = resolved_candidate
+                elif fallback_candidate:
+                    logger.info(
+                        f"[NatureGrabber] No live streams found; "
+                        f"using recording: {fallback_title!r}"
+                    )
+                    resolved_url = fallback_candidate
+                    self._last_channel = fallback_channel
+                    current_channel = fallback_channel
+                    current_title = fallback_title
 
                 if resolved_url:
                     if cap is not None:
@@ -578,8 +606,8 @@ def _spawn_player(url: str) -> tuple[list[subprocess.Popen], subprocess.Popen, l
         # probing an empty stdin pipe while yt-dlp's internal ffmpeg starts up.
         resolved = _resolve_ytdlp_with_title(url)
         if resolved:
-            direct_url, title = resolved
-            logger.info(f"[Player] Now playing: {title!r} (from {url[:60]})")
+            direct_url, title, is_live = resolved
+            logger.info(f"[Player] Now playing: {title!r} live={is_live} (from {url[:60]})")
             mpv_proc = subprocess.Popen(
                 _build_mpv_cmd(direct_url, use_ytdl=False),
                 stderr=subprocess.DEVNULL,
