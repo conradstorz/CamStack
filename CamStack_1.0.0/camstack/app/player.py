@@ -439,15 +439,22 @@ class NatureGrabber:
             return self._frame
 
     def _run(self) -> None:
+        from app.webcam_curator import record_play
         cap = None
         last_resolve: float = 0.0
         direct_url: Optional[str] = None
+        current_channel: Optional[str] = None
+        current_title: Optional[str] = None
 
         while not self._stop_event.is_set():
             now = time.monotonic()
 
             # Resolve / refresh the direct stream URL when needed.
             if direct_url is None or (now - last_resolve) >= self._REFRESH_INTERVAL:
+                # Record the previous channel's play duration before switching.
+                if current_channel and last_resolve:
+                    elapsed = int(now - last_resolve)
+                    record_play(current_channel, title=current_title or "", duration=elapsed)
                 import random as _random
                 resolved_url: Optional[str] = None
                 # Load per-stream blocklist from config.
@@ -477,6 +484,8 @@ class NatureGrabber:
                         continue
                     resolved_url = url_candidate
                     self._last_channel = candidate  # remember for next refresh
+                    current_channel = candidate
+                    current_title = title_candidate
                     logger.info(f"[NatureGrabber] Selected stream: {title_candidate!r}")
                     break
 
@@ -631,6 +640,7 @@ def _probe_any_rtsp(camera_urls: list[str], timeout: int = 5) -> bool:
 
 def _fallback_loop(recover_urls: list[str] | None = None) -> int:
     import time
+    from app.webcam_curator import record_play
 
     _RECOVERY_INTERVAL = 60   # seconds between camera probe attempts
     last_recovery_check: float = 0.0   # zero forces an immediate first probe
@@ -655,10 +665,13 @@ def _fallback_loop(recover_urls: list[str] | None = None) -> int:
         + f" (viewers={current.viewers})"
     )
     procs, primary, files = _spawn_player(current.url)
+    stream_start = time.monotonic()
 
     while True:
         try:
             if primary.poll() is not None:
+                duration = int(time.monotonic() - stream_start)
+                record_play(current.url, title=current.title or "", duration=duration)
                 blocked.add(current.url)
                 logger.warning(
                     f"[Fallback] Stream ended/crashed: {current.url}"
@@ -687,6 +700,7 @@ def _fallback_loop(recover_urls: list[str] | None = None) -> int:
                 _terminate_procs(procs)
                 _close_files(files)
                 procs, primary, files = _spawn_player(current.url)
+                stream_start = time.monotonic()
                 continue
         except Exception as e:
             logger.warning(f"Fallback loop error: {e}")

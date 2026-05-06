@@ -710,6 +710,27 @@ def record_event(
     return True
 
 
+def record_play(feed_url: str, title: str = "", duration: int | None = None) -> None:
+    """Record a play event for a feed URL, auto-inserting into the DB if unknown.
+
+    Safe to call from player.py — silently no-ops on any error so a DB
+    problem never interrupts playback.
+    """
+    try:
+        fid = _feed_id(feed_url)
+        with _get_db() as conn:
+            if not conn.execute("SELECT id FROM feeds WHERE id=?", (fid,)).fetchone():
+                _upsert_feed(conn, {
+                    "url": feed_url,
+                    "title": title or feed_url,
+                    "source": "player",
+                    "category": "nature",
+                })
+        record_event(feed_url, "played", duration=duration)
+    except Exception as exc:
+        logger.debug(f"[Curator] record_play silenced: {exc}")
+
+
 def _maybe_retire(conn: sqlite3.Connection, feed_id: str) -> None:
     """Deactivate a chronically failing feed when its reliability falls below threshold."""
     cfg = _load_curator_cfg()
