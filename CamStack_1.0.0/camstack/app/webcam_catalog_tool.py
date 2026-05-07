@@ -79,6 +79,18 @@ HTTP_TIMEOUT_SECONDS = 20
 DEFAULT_THUMBNAIL_SECONDS = 12
 DEFAULT_YOUTUBE_SEARCH_LIMIT = 50
 
+# Discovery blocklist: channel/uploader name substrings (lowercase).
+BLOCKED_CHANNELS: list[str] = [
+    "bbc nature",
+    "bbc earth",
+    "nightcam",
+]
+
+# Discovery blocklist: URL substrings (lowercase).
+BLOCKED_URL_SUBSTRINGS: list[str] = [
+    "nightcam",
+]
+
 console = Console()
 
 
@@ -452,6 +464,22 @@ def normalize_youtube_item(raw: dict[str, Any]) -> DiscoveredYouTubeItem | None:
     )
 
 
+def is_blocked(item: DiscoveredYouTubeItem) -> tuple[bool, str]:
+    """Return (True, reason) if the item matches a blocked source, else (False, '')."""
+    channel_lower = (item.channel or item.uploader or "").lower()
+    url_lower = item.webpage_url.lower()
+
+    for pattern in BLOCKED_CHANNELS:
+        if pattern in channel_lower:
+            return True, f"blocked channel: {pattern}"
+
+    for pattern in BLOCKED_URL_SUBSTRINGS:
+        if pattern in url_lower:
+            return True, f"blocked URL pattern: {pattern}"
+
+    return False, ""
+
+
 def looks_like_live_cam(item: DiscoveredYouTubeItem, include_archives: bool = False) -> bool:
     """Decide whether a YouTube item looks like a webcam/livestream candidate."""
     haystack = " ".join(
@@ -566,6 +594,18 @@ def import_discovered_items(
     results: list[DiscoveryResult] = []
 
     for item in items:
+        blocked, block_reason = is_blocked(item)
+        if blocked:
+            results.append(
+                DiscoveryResult(
+                    status=DiscoveryStatus.SKIPPED_FILTER,
+                    title=item.title,
+                    url=item.webpage_url,
+                    reason=block_reason,
+                )
+            )
+            continue
+
         if not looks_like_live_cam(item, include_archives=include_archives):
             results.append(
                 DiscoveryResult(
