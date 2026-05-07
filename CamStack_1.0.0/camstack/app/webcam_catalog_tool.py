@@ -1,4 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "httpx",
+#   "loguru",
+#   "pydantic",
+#   "rich",
+#   "yt-dlp",
+# ]
+# ///
 """Curate, verify, discover, and report on public live webcam feeds.
 
 This tool maintains a JSON catalog of live camera feeds such as nature cams,
@@ -13,11 +23,8 @@ scan private IP ranges, or discover cameras by probing the internet. It only
 works with public URLs, public YouTube metadata, and feeds that you choose to
 add to the catalog.
 
-Recommended install with uv:
-
-    uv init webcam-catalog
-    cd webcam-catalog
-    uv add httpx pydantic loguru rich yt-dlp
+Dependencies are declared inline (PEP 723) and managed automatically by uv.
+No virtualenv setup is required.
 
 Optional but strongly recommended:
 
@@ -25,25 +32,25 @@ Optional but strongly recommended:
 
 Example usage:
 
-    uv run python webcam_catalog_tool.py init
-    uv run python webcam_catalog_tool.py seed
+    uv run webcam_catalog_tool.py init
+    uv run webcam_catalog_tool.py seed
 
-    uv run python webcam_catalog_tool.py discover-youtube-channel \
+    uv run webcam_catalog_tool.py discover-youtube-channel \
         --url "https://www.youtube.com/@ExploreLiveNatureCams/streams" \
         --source "Explore.org" \
         --category nature \
         --tags explore nature youtube
 
-    uv run python webcam_catalog_tool.py discover-youtube-search \
+    uv run webcam_catalog_tool.py discover-youtube-search \
         --query "powered by EXPLORE.org live cam" \
         --limit 50 \
         --source "Explore.org" \
         --category nature \
         --tags explore nature youtube
 
-    uv run python webcam_catalog_tool.py list
-    uv run python webcam_catalog_tool.py verify
-    uv run python webcam_catalog_tool.py report
+    uv run webcam_catalog_tool.py list
+    uv run webcam_catalog_tool.py verify
+    uv run webcam_catalog_tool.py report
 """
 
 from __future__ import annotations
